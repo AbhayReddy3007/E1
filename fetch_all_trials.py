@@ -56,7 +56,7 @@ import ctgov_trials
 import ctri_trials
 import euct_trials
 import gemini_enrich
-import gemini_search_trials
+import gemini_two_step
 import ictrp_trials
 import jrct_trials
 import rebec_trials
