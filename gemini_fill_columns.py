@@ -2,13 +2,7 @@
 """
 gemini_fill_columns.py – Gemini Step 2 extraction for all trials.
 
-Takes trial_id + source_url from already-fetched trials and uses
-Gemini + Google Search to extract the 22 output columns.
-
-Follows the EXACT same extraction pattern as the reference
-gemini_extractor.py get_trial_details() function.
-
-Only looks at the source URL / registry page — no PubMed, no other sources.
+Follows the reference gemini_extractor.py pattern exactly.
 """
 
 from __future__ import annotations
@@ -29,7 +23,6 @@ BATCH_SIZE = 6
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 2.0
 
-# The exact output fields we need (matches the 22-column output)
 OUTPUT_FIELDS = [
     "dosage", "phase", "trial_title", "trial_study_type", "trial_size",
     "trial_location", "trial_start_date", "trial_completion_date",
@@ -42,7 +35,7 @@ _print_lock = threading.Lock()
 
 
 def _gemini_call(session, url, prompt, timeout=180):
-    """Gemini API call with google_search tool and exponential backoff."""
+    """Gemini call with google_search. Returns full raw response text."""
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
@@ -54,14 +47,23 @@ def _gemini_call(session, url, prompt, timeout=180):
             r = session.post(url, data=json.dumps(body), timeout=timeout)
             if r.status_code in (429, 500, 502, 503, 504):
                 with _print_lock:
-                    print(f"    Rate limit/server error ({r.status_code}) – "
-                          f"waiting {backoff:.0f}s (attempt {attempt}/{MAX_RETRIES})",
-                          file=sys.stderr)
+                    print(f"    [{r.status_code}] waiting {backoff:.0f}s "
+                          f"(attempt {attempt}/{MAX_RETRIES})", file=sys.stderr)
                 time.sleep(backoff); backoff *= 2; continue
             r.raise_for_status()
-            parts = (r.json().get("candidates") or [{}])[0] \
-                .get("content", {}).get("parts", [])
-            return "".join(p.get("text", "") for p in parts).strip()
+
+            payload = r.json()
+            cands = payload.get("candidates") or []
+            if not cands:
+                return ""
+
+            # Collect ALL text parts (grounding wraps text in multiple parts)
+            all_text = ""
+            for part in (cands[0].get("content") or {}).get("parts") or []:
+                if part.get("text"):
+                    all_text += part["text"]
+            return all_text.strip()
+
         except Exception as exc:
             if attempt == MAX_RETRIES:
                 with _print_lock:
@@ -71,96 +73,129 @@ def _gemini_call(session, url, prompt, timeout=180):
     return ""
 
 
-def _parse_json(text):
-    """Parse JSON from Gemini response, handling markdown fences and truncation."""
+def _parse_json(text: str) -> Optional[Any]:
+    """
+    Robustly extract JSON from Gemini response.
+    Handles: markdown fences, grounding metadata, truncation, extra text.
+    """
     if not text:
         return None
-    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.M)
-    text = re.sub(r"```\s*$", "", text, flags=re.M).strip()
 
-    # Find JSON array or object
-    m = re.search(r"[\[{].*[\]}]", text, flags=re.DOTALL)
-    if not m:
+    # Strip markdown code fences
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```", "", text)
+
+    # The reference safe_json_parse: find first { or [
+    json_start = -1
+    for i, c in enumerate(text):
+        if c in "{[":
+            json_start = i
+            break
+    if json_start < 0:
         return None
+    text = text[json_start:]
 
-    raw = m.group(0)
-
-    # Attempt 1: direct parse
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 2: json_repair library
+    # Attempt 1: json_repair (reference uses this first)
     try:
         from json_repair import repair_json
-        result = repair_json(raw, return_objects=True)
+        result = repair_json(text, return_objects=True)
         if result is not None:
             return result
     except Exception:
         pass
 
-    # Attempt 3: raw_decode (handles "Extra data" after valid JSON)
+    # Attempt 2: direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3: raw_decode to handle trailing garbage
     try:
         decoder = json.JSONDecoder()
-        obj, _ = decoder.raw_decode(raw)
+        obj, _ = decoder.raw_decode(text)
         return obj
     except Exception:
         pass
 
+    # Attempt 4: find the last complete } and try up to there
+    last_brace = text.rfind("}")
+    if last_brace > 0:
+        try:
+            return json.loads(text[:last_brace + 1])
+        except Exception:
+            pass
+
     return None
 
 
-def _build_prompt(drug: str, batch: List[Dict[str, Any]]) -> str:
-    """Build the Step 2 extraction prompt — mirrors gemini_extractor.py exactly."""
+def _extract_trials(data: Any) -> List[dict]:
+    """Extract trials list from parsed JSON — handles dict or list."""
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return [t for t in data if isinstance(t, dict)]
+    if isinstance(data, dict):
+        # Could be {"trials": [...]} or a single trial object
+        if "trials" in data:
+            t = data["trials"]
+            return [x for x in t if isinstance(x, dict)] if isinstance(t, list) else []
+        # Single trial object
+        if any(k in data for k in ("trial_id", "Trial ID", "Molecule", "dosage")):
+            return [data]
+    return []
 
+
+def _normalise_trial_id(tid: str) -> str:
+    """Strip program name suffixes like 'NCT123 (STEP 1)' → 'NCT123'."""
+    return tid.split("(")[0].strip().split(" ")[0].strip() if tid else ""
+
+
+def _build_prompt(drug: str, batch: List[Dict[str, Any]]) -> str:
     trial_lines = []
     for row in batch:
         tid = row.get("trial_id", "")
         url = row.get("source_url", "")
-        trial_lines.append(f"- {tid} (Source: {url})")
+        title = row.get("trial_title", "")[:60]
+        trial_lines.append(f"- Trial ID: {tid} | URL: {url} | Title: {title}")
 
-    return f"""You are a clinical data extraction engine with access to Google Search.
+    return f"""You are a clinical data extraction engine. Extract data for these {len(batch)} {drug} trials.
 
-Task: Extract structured clinical trial data for these {len(batch)} {drug} trials.
+For EACH trial, navigate to the Source URL provided and extract information ONLY from that registry page.
+Do NOT use PubMed, Wikipedia, or any other source — only the registry page at the URL given.
 
-For EACH trial below, go to the Source URL provided and extract data
-ONLY from what is displayed on that specific registry page.
-Do NOT use PubMed, news articles, or any other external source.
-
-TRIALS TO EXTRACT:
+TRIALS:
 {chr(10).join(trial_lines)}
 
-For EACH trial, extract these fields from the registry page:
-- trial_id: (keep exactly as provided above)
-- trial_title: The FULL official title of the trial as listed on the registry page. Use "N/A" only if completely unavailable.
-- dosage: The PRIMARY or HIGHEST dosage tested. Report ONLY ONE dosage value (e.g., "2.4 mg OW", "1.0 mg OW", "14 mg QD"). If multiple doses were tested, choose the highest dose. Format: "[amount] [unit] [frequency]"
-- phase: Trial phase number (e.g., "3", "2", "3b", "4"). Just the number.
-- trial_study_type: Type of trial — must be exactly one of: "Interventional", "Observational", "Expanded Access". Use "N/A" only if completely unavailable.
-- trial_size: Total enrollment number (integer)
-- trial_location: Countries where trial was conducted (comma-separated)
-- trial_start_date: Study start date in format "YYYY-MM-DD" or "YYYY-MM"
-- trial_completion_date: Primary completion date in format "YYYY-MM-DD" or "YYYY-MM"
-- phase_status: "Completed", "Active", "Recruiting", "Terminated", "Withdrawn"
-- hba1c_change_pct: HbA1c reduction in percentage points (positive number, e.g., "1.8"). Use "N/A" if not reported on the registry page.
-- hba1c_duration: Timepoint for HbA1c measurement (e.g., "26 wk", "52 wk"). Use "N/A" if not reported.
-- weight_change_pct: Body weight loss percentage (positive number, e.g., "15.2"). Use "N/A" if not reported on the registry page.
-- weight_duration: Timepoint for weight measurement (e.g., "68 wk", "104 wk"). Use "N/A" if not reported.
-- alt_reduction_pct: ALT enzyme reduction percentage (e.g., "35"). Use "N/A" if not reported on the registry page.
-- alt_duration: Timepoint for ALT measurement. Use "N/A" if not reported.
-- mash_resolution_pct: MASH/NASH resolution rate (e.g., "59"). Use "N/A" if not a MASH trial or not reported.
-- mash_duration: Timepoint for MASH assessment. Use "N/A" if not reported.
-- company_name: Sponsor company name as shown on the registry page
-- source_url: (keep exactly as provided above)
+For EACH trial, extract:
+- trial_id: (copy exactly from Trial ID above)
+- trial_title: Full official title from the registry page
+- dosage: Highest dosage tested (e.g., "2.4 mg OW", "14 mg QD"). "N/A" if not available.
+- phase: Phase number only (e.g., "3", "2", "1"). "N/A" if not available.
+- trial_study_type: "Interventional", "Observational", or "Expanded Access". "N/A" if not available.
+- trial_size: Total enrollment number (integer). "N/A" if not available.
+- trial_location: Countries where trial was conducted. "N/A" if not available.
+- trial_start_date: Study start date (YYYY-MM-DD or YYYY-MM). "N/A" if not available.
+- trial_completion_date: Primary completion date (YYYY-MM-DD or YYYY-MM). "N/A" if not available.
+- phase_status: "Completed", "Active", "Recruiting", "Terminated", or "N/A"
+- hba1c_change_pct: HbA1c reduction % as positive number (e.g., "1.8"). "N/A" if not on page.
+- hba1c_duration: Timepoint (e.g., "26 wk"). "N/A" if not on page.
+- weight_change_pct: Body weight loss % as positive number (e.g., "15.2"). "N/A" if not on page.
+- weight_duration: Timepoint (e.g., "68 wk"). "N/A" if not on page.
+- alt_reduction_pct: ALT reduction % (e.g., "35"). "N/A" if not on page.
+- alt_duration: Timepoint. "N/A" if not on page.
+- mash_resolution_pct: MASH/NASH resolution % (e.g., "59"). "N/A" if not on page.
+- mash_duration: Timepoint. "N/A" if not on page.
+- company_name: Sponsor/company name from the registry page.
+- source_url: (copy exactly from URL above)
 
-CRITICAL RULES:
-- Include ALL {len(batch)} trials even if data is incomplete
-- Use "N/A" for fields that are genuinely not available on the registry page
-- DO NOT fabricate or hallucinate any values — if it's not on the page, say "N/A"
-- Report reductions as positive numbers (weight loss of 15% → "15")
-- A few trials may not have results posted — that is OK, report "N/A" for those fields
+IMPORTANT:
+- Return ALL {len(batch)} trials
+- If a field is NOT present on the registry page, use "N/A" — do not guess
+- Do not fabricate any values
+- Return reductions as positive numbers
 
-Return JSON:
+Return ONLY a JSON object with this structure:
 {{
   "trials": [
     {{
@@ -169,19 +204,19 @@ Return JSON:
       "dosage": "...",
       "phase": "...",
       "trial_study_type": "...",
-      "trial_size": 0,
+      "trial_size": "...",
       "trial_location": "...",
       "trial_start_date": "...",
       "trial_completion_date": "...",
       "phase_status": "...",
-      "hba1c_change_pct": "...",
-      "hba1c_duration": "...",
-      "weight_change_pct": "...",
-      "weight_duration": "...",
-      "alt_reduction_pct": "...",
-      "alt_duration": "...",
-      "mash_resolution_pct": "...",
-      "mash_duration": "...",
+      "hba1c_change_pct": "N/A",
+      "hba1c_duration": "N/A",
+      "weight_change_pct": "N/A",
+      "weight_duration": "N/A",
+      "alt_reduction_pct": "N/A",
+      "alt_duration": "N/A",
+      "mash_resolution_pct": "N/A",
+      "mash_duration": "N/A",
       "company_name": "...",
       "source_url": "..."
     }}
@@ -193,16 +228,10 @@ def fill_columns(drug: str, rows: List[Dict[str, Any]],
                  api_key: Optional[str] = None,
                  model: str = DEFAULT_MODEL,
                  workers: int = 3) -> List[Dict[str, Any]]:
-    """Fill missing columns for all rows using Gemini + Google Search.
-
-    Only fills EMPTY fields — never overwrites existing data from APIs.
-    """
     api_key = api_key or os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        print("  [Gemini fill] no GEMINI_API_KEY – columns left as-is.",
-              file=sys.stderr)
+        print("  [Gemini fill] no GEMINI_API_KEY – skipping.", file=sys.stderr)
         return rows
-
     if not rows:
         return rows
 
@@ -213,76 +242,73 @@ def fill_columns(drug: str, rows: List[Dict[str, Any]],
         "x-goog-api-key": api_key,
     })
 
-    # Build batches
-    batches = []
-    for i in range(0, len(rows), BATCH_SIZE):
-        batches.append((i, rows[i:i + BATCH_SIZE]))
-
-    print(f"  [Gemini fill] Extracting data for {len(rows)} trials in "
-          f"{len(batches)} batches (batch size {BATCH_SIZE}) ...",
+    batches = [(i, rows[i:i + BATCH_SIZE]) for i in range(0, len(rows), BATCH_SIZE)]
+    print(f"  [Gemini fill] {len(rows)} trials in {len(batches)} batches ...",
           file=sys.stderr)
 
     def process_batch(batch_start, batch):
-        # Stagger to avoid rate limits
-        stagger = (batch_start // BATCH_SIZE) % workers
+        stagger = (batch_start // BATCH_SIZE) % max(1, workers)
         if stagger > 0:
             time.sleep(stagger * 0.5)
 
-        prompt = _build_prompt(drug, batch)
-        raw = _gemini_call(session, url, prompt)
-        data = _parse_json(raw)
-        if not data:
+        raw_text = _gemini_call(session, url, _build_prompt(drug, batch))
+        if not raw_text:
             return batch_start, []
 
-        if isinstance(data, dict):
-            trials = data.get("trials", [])
-        elif isinstance(data, list):
-            trials = data
-        else:
-            trials = []
+        data = _parse_json(raw_text)
+        trials = _extract_trials(data)
 
-        return batch_start, [t for t in trials if isinstance(t, dict)]
+        if not trials:
+            # Log the raw response for diagnosis
+            with _print_lock:
+                print(f"    [parse fail] raw response preview: "
+                      f"{raw_text[:200]!r}", file=sys.stderr)
 
-    # Process batches with controlled concurrency
+        return batch_start, trials
+
     results_map = {}
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {pool.submit(process_batch, idx, batch): idx
                    for idx, batch in batches}
         done = 0
         for fut in as_completed(futures):
-            batch_start, gemini_trials = fut.result()
-            results_map[batch_start] = gemini_trials
+            batch_start, trials = fut.result()
+            results_map[batch_start] = trials
             done += 1
             with _print_lock:
                 print(f"  [Gemini fill] batch {done}/{len(batches)} "
-                      f"→ {len(gemini_trials)} trial(s) extracted",
-                      file=sys.stderr)
+                      f"→ {len(trials)} extracted", file=sys.stderr)
 
-    # Merge Gemini results back into rows (only fill empty fields)
+    # Merge back: build lookup index with normalised IDs
     filled_count = 0
     for batch_start, batch in batches:
         gemini_trials = results_map.get(batch_start, [])
 
-        # Index Gemini results by trial_id for matching
-        gemini_by_id = {}
+        # Index by both raw and normalised trial_id
+        gemini_by_id: Dict[str, dict] = {}
         for gt in gemini_trials:
-            tid = str(gt.get("trial_id", "")).strip()
-            if tid:
-                gemini_by_id[tid] = gt
+            raw_tid = str(gt.get("trial_id", "") or "").strip()
+            if raw_tid:
+                gemini_by_id[raw_tid] = gt
+                # Also index by normalised (strips program name suffix)
+                norm = _normalise_trial_id(raw_tid)
+                if norm and norm != raw_tid:
+                    gemini_by_id[norm] = gt
 
         for row in batch:
-            tid = str(row.get("trial_id", "")).strip()
-            gt = gemini_by_id.get(tid)
+            raw_tid = str(row.get("trial_id", "") or "").strip()
+            norm_tid = _normalise_trial_id(raw_tid)
+
+            gt = gemini_by_id.get(raw_tid) or gemini_by_id.get(norm_tid)
             if not gt:
                 continue
 
-            # Fill only empty/missing fields — never overwrite existing data
             for field in OUTPUT_FIELDS:
                 current = str(row.get(field, "") or "").strip()
                 new_val = str(gt.get(field, "") or "").strip()
-
-                if (not current or current.lower() in ("", "n/a", "none")) and \
-                   new_val and new_val.lower() not in ("", "n/a", "none", "null"):
+                # Only fill if current is empty/N/A AND new value is real
+                if (not current or current.lower() in ("", "n/a", "none", "null")) \
+                   and new_val and new_val.lower() not in ("", "n/a", "none", "null"):
                     row[field] = new_val
                     filled_count += 1
 
