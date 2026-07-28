@@ -1,41 +1,24 @@
 #!/usr/bin/env python3
 """
-gemini_search_trials.py
-=======================
+gemini_search_trials.py – Gemini + Google Search fallback for blocked registries.
 
-Uses Gemini 2.5 Flash + Google Search grounding to find clinical trials from
-registries that block automated scraping (CTRI, jRCT, ANZCTR, ChiCTR, CRIS,
-ReBEC).
-
-Gemini searches the web for trials on a given registry, returns structured
-JSON, and we map it into the unified schema. The `source` column is set to
-the registry name (never "Gemini").
-
-This is a FALLBACK — it only runs for registries that returned 0 rows from
-direct scraping.
+Uses Gemini 2.5 Flash with google_search grounding (no responseSchema — they
+conflict, causing a 400). Instead we ask for JSON in the prompt and parse it.
 """
 
 from __future__ import annotations
-
-import json
-import os
-import re
-import sys
-import time
+import json, os, re, sys, time
 from typing import Any, Dict, List, Optional
-
 import requests
 
 from registry_common import (
     ALLOWED_SOURCES, SRC_ANZCTR, SRC_CHICTR, SRC_CRIS, SRC_CTRI,
-    SRC_JRCT, SRC_REBEC, UNIFIED_COLUMNS, blank_row, clean, join,
-    make_session,
+    SRC_JRCT, SRC_REBEC, UNIFIED_COLUMNS, blank_row, clean, make_session,
 )
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_MODEL = "gemini-2.5-flash"
 
-# Registry site URLs for Gemini to search
 REGISTRY_SITES = {
     SRC_CTRI: "ctri.nic.in",
     SRC_JRCT: "jrct.mhlw.go.jp",
@@ -54,60 +37,50 @@ REGISTRY_FULL_NAMES = {
     SRC_REBEC: "Brazilian Clinical Trials Registry (ReBEC) at ensaiosclinicos.gov.br",
 }
 
-SYSTEM_PROMPT = """You are a clinical trial search tool. You use Google Search to find
-clinical trials registered on specific national trial registries.
+PROMPT_TEMPLATE = """Search for all clinical trials of the drug "{drug}" registered on {registry_name}.
+
+Search Google for: site:{site} "{drug}"
+Also search for: {drug} clinical trial {site}
+
+For EACH trial you find, extract these fields:
+- trial_id (the registry's own ID, e.g. CTRI/2023/04/052053, jRCT2031200001, ACTRN12621000123456, ChiCTR2300078000, KCT0009234, RBR-6qvdftm)
+- title
+- status (recruitment status)
+- phase
+- study_type
+- conditions (disease/condition studied)
+- interventions (all interventions including dosage)
+- drug_names
+- dosage (dose amounts mentioned)
+- sponsor
+- countries
+- target_enrollment (planned number of participants)
+- actual_enrollment
+- age_min
+- age_max
+- gender
+- primary_outcome
+- secondary_outcome
+- start_date
+- completion_date
+- registration_date
+- results_available (Yes/No)
+- findings (any results mentioned)
+- url (direct link to the trial page on the registry)
 
 RULES:
-1. Search ONLY the specific registry website you are asked about.
-2. Return ONLY trials you actually find via search. Never invent trials.
-3. Every trial MUST have a real registry ID (e.g., CTRI/2023/04/052053, jRCT2031200001,
-   ACTRN12621000123456, ChiCTR2300078000, KCT0009234, RBR-6qvdftm).
-4. If you cannot find any trials for a drug on that registry, return an empty array [].
-5. Include the source URL where you found each trial.
-6. Extract as many fields as possible from the search results.
-7. Return ONLY valid JSON, no markdown, no backticks, no explanation."""
+1. ONLY return trials you actually find in search results. NEVER invent trials.
+2. Every trial MUST have a real registry ID.
+3. If you find NO trials, return exactly: []
+4. Return ONLY a JSON array, no markdown backticks, no explanation before or after.
 
-TRIAL_SCHEMA = {
-    "type": "ARRAY",
-    "items": {
-        "type": "OBJECT",
-        "properties": {
-            "trial_id": {"type": "STRING", "description": "Registry ID (e.g. CTRI/2023/04/052053)"},
-            "title": {"type": "STRING"},
-            "public_title": {"type": "STRING"},
-            "status": {"type": "STRING", "description": "Recruitment status"},
-            "phase": {"type": "STRING"},
-            "study_type": {"type": "STRING"},
-            "study_design": {"type": "STRING"},
-            "conditions": {"type": "STRING"},
-            "interventions": {"type": "STRING"},
-            "drug_names": {"type": "STRING"},
-            "sponsor": {"type": "STRING"},
-            "countries": {"type": "STRING"},
-            "target_enrollment": {"type": "STRING"},
-            "actual_enrollment": {"type": "STRING"},
-            "age_min": {"type": "STRING"},
-            "age_max": {"type": "STRING"},
-            "gender": {"type": "STRING"},
-            "inclusion_criteria": {"type": "STRING"},
-            "exclusion_criteria": {"type": "STRING"},
-            "primary_outcome": {"type": "STRING"},
-            "secondary_outcome": {"type": "STRING"},
-            "start_date": {"type": "STRING"},
-            "completion_date": {"type": "STRING"},
-            "registration_date": {"type": "STRING"},
-            "results_available": {"type": "STRING"},
-            "findings": {"type": "STRING", "description": "Any results/findings mentioned"},
-            "url": {"type": "STRING", "description": "Direct URL to the trial page"},
-        },
-        "required": ["trial_id", "title", "url"],
-    },
-}
+Example format:
+[{{"trial_id": "CTRI/2023/04/052053", "title": "...", "status": "Completed", "phase": "Phase 3", "url": "https://ctri.nic.in/..."}}]"""
 
 
 class GeminiTrialSearcher:
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL,
-                 timeout: int = 120, retries: int = 3):
+                 timeout: int = 180, retries: int = 3):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
@@ -120,34 +93,20 @@ class GeminiTrialSearcher:
         })
 
     def search_registry(self, drug: str, source: str) -> List[Dict[str, Any]]:
-        """
-        Ask Gemini to search a specific registry for trials of `drug`.
-        Returns list of dicts with trial fields.
-        """
         registry_name = REGISTRY_FULL_NAMES.get(source, source)
         site = REGISTRY_SITES.get(source, "")
 
-        prompt = (
-            f"Search for all clinical trials of the drug \"{drug}\" registered on "
-            f"{registry_name}.\n\n"
-            f"Search the site {site} specifically. Also try searching Google for: "
-            f'site:{site} "{drug}"\n\n'
-            f"For each trial you find, extract: trial ID, title, status, phase, "
-            f"sponsor, conditions, interventions, start date, enrollment, and "
-            f"the direct URL to the trial page.\n\n"
-            f"Return a JSON array of trial objects. If you find no trials, "
-            f"return an empty array []."
-        )
+        prompt = PROMPT_TEMPLATE.format(
+            drug=drug, registry_name=registry_name, site=site)
 
+        # google_search tool CANNOT be combined with responseSchema;
+        # we ask for JSON in the prompt instead
         body = {
-            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "tools": [{"google_search": {}}],
             "generationConfig": {
                 "temperature": 0,
                 "maxOutputTokens": 8192,
-                "responseMimeType": "application/json",
-                "responseSchema": TRIAL_SCHEMA,
             },
         }
 
@@ -158,6 +117,11 @@ class GeminiTrialSearcher:
                                       timeout=self.timeout)
                 if r.status_code in (429, 500, 502, 503, 504):
                     raise requests.HTTPError(f"HTTP {r.status_code}")
+                if r.status_code == 400:
+                    # Log the actual error for debugging
+                    err = r.text[:500]
+                    print(f"    [Gemini] 400 response: {err}", file=sys.stderr)
+                    raise requests.HTTPError(f"HTTP 400: {err[:200]}")
                 r.raise_for_status()
                 payload = r.json()
 
@@ -166,17 +130,31 @@ class GeminiTrialSearcher:
                     return []
 
                 parts = (cands[0].get("content") or {}).get("parts") or []
-                raw = "".join(p.get("text", "") for p in parts).strip()
-                raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+                raw = ""
+                for p in parts:
+                    if p.get("text"):
+                        raw += p["text"]
+                raw = raw.strip()
 
-                if not raw or raw == "[]":
+                # Extract JSON array from the response
+                raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.M)
+                raw = re.sub(r"```\s*$", "", raw, flags=re.M)
+                raw = raw.strip()
+
+                # Find the JSON array in the response
+                m = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+                if not m:
+                    if "[]" in raw or "no trial" in raw.lower():
+                        return []
                     return []
 
-                trials = json.loads(raw)
+                trials = json.loads(m.group(0))
                 if isinstance(trials, list):
                     return trials
                 return []
 
+            except json.JSONDecodeError:
+                return []
             except Exception as exc:
                 last_exc = exc
                 if attempt < self.retries:
@@ -188,7 +166,6 @@ class GeminiTrialSearcher:
 
 
 def _validate_trial_id(trial_id: str, source: str) -> bool:
-    """Check that the trial ID looks real for the given registry."""
     tid = clean(trial_id)
     if not tid or len(tid) < 5:
         return False
@@ -207,12 +184,14 @@ def _validate_trial_id(trial_id: str, source: str) -> bool:
 
 
 def _to_row(trial: Dict[str, Any], source: str) -> Dict[str, Any]:
-    """Map Gemini's JSON output to a unified row."""
     row = blank_row(source)
-    # Map directly – field names match unified schema
     for col in UNIFIED_COLUMNS:
         if col in trial and trial[col]:
             row[col] = clean(trial[col])
+    # Also capture fields not in unified schema
+    for k, v in trial.items():
+        if k not in row and clean(v):
+            row[k] = clean(v)
     row["source"] = source
     return row
 
@@ -223,17 +202,12 @@ def search_missing_registries(
     api_key: Optional[str] = None,
     model: str = DEFAULT_MODEL,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    For each source in `missing_sources`, use Gemini + Google Search to find
-    trials. Returns {source_name: [rows]}.
-    """
     api_key = api_key or os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        print("  [Gemini search] no GEMINI_API_KEY – cannot search missing "
-              "registries.", file=sys.stderr)
+        print("  [Gemini search] no GEMINI_API_KEY – cannot search.",
+              file=sys.stderr)
         return {}
 
-    # Only search registries we have site URLs for
     searchable = [s for s in missing_sources if s in REGISTRY_SITES]
     if not searchable:
         return {}
@@ -247,11 +221,9 @@ def search_missing_registries(
         try:
             trials = searcher.search_registry(drug, source)
         except Exception as exc:
-            print(f"  [Gemini search] {source} failed: {exc}",
-                  file=sys.stderr)
+            print(f"  [Gemini search] {source} failed: {exc}", file=sys.stderr)
             continue
 
-        # Validate and convert
         valid_rows: List[Dict[str, Any]] = []
         rejected = 0
         for trial in trials:
@@ -267,7 +239,6 @@ def search_missing_registries(
         if rejected:
             msg += f" ({rejected} rejected – invalid IDs)"
         print(msg, file=sys.stderr)
-
-        time.sleep(1)  # rate limit politeness
+        time.sleep(1)
 
     return results

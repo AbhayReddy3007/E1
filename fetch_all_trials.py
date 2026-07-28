@@ -372,17 +372,85 @@ def main() -> int:
         if meta:
             combined.extend(meta["rows"])
 
-    # master keeps only the unified columns so the sheet stays readable
-    slim = []
-    for row in combined:
-        slim.append({c: row.get(c, "") for c in out_columns})
+    # ── Phase normalisation (Phase III -> 3, PHASE3 -> 3, etc.) ──────────────
+    def normalise_phase(raw: str) -> str:
+        if not raw:
+            return ""
+        s = re.sub(r"(?i)\bphase\s*", "phase ", str(raw))
+        MAP = {"one": "1", "two": "2", "three": "3", "four": "4",
+               "i": "1", "ii": "2", "iii": "3", "iv": "4",
+               "1": "1", "2": "2", "3": "3", "4": "4"}
+        nums = []
+        for tok in re.split(r"[/,;\s]+", s.lower()):
+            tok = tok.strip("(). ")
+            if tok in MAP and MAP[tok] not in nums:
+                nums.append(MAP[tok])
+        return "/".join(nums) if nums else raw.strip()
+
+    # ── Remap to user-requested output columns ──────────────────────────────
+    FINAL_COLUMNS = [
+        "source",
+        "trial_id",
+        "dosage",
+        "phase",
+        "trial_title",
+        "trial_study_type",
+        "trial_size",
+        "trial_location",
+        "trial_start_date",
+        "trial_completion_date",
+        "phase_status",
+        "hba1c_change_pct",
+        "hba1c_duration",
+        "weight_change_pct",
+        "weight_duration",
+        "alt_reduction_pct",
+        "alt_duration",
+        "mash_resolution_pct",
+        "mash_duration",
+        "company_name",
+        "source_url",
+        # keep all other columns after the primary ones
+    ]
+
+    def remap_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        out["source"] = row.get("source", "")
+        out["trial_id"] = row.get("trial_id", "")
+        out["dosage"] = row.get("dosage", "")
+        out["phase"] = normalise_phase(row.get("phase", ""))
+        out["trial_title"] = row.get("title") or row.get("public_title", "")
+        out["trial_study_type"] = row.get("study_type", "")
+        out["trial_size"] = (row.get("actual_enrollment")
+                             or row.get("target_enrollment", ""))
+        out["trial_location"] = row.get("countries", "")
+        out["trial_start_date"] = row.get("start_date", "")
+        out["trial_completion_date"] = row.get("completion_date", "")
+        out["phase_status"] = row.get("status", "")
+        out["hba1c_change_pct"] = row.get("hba1c_change_pct", "")
+        out["hba1c_duration"] = row.get("hba1c_duration", "")
+        out["weight_change_pct"] = row.get("weight_change_pct", "")
+        out["weight_duration"] = row.get("weight_duration", "")
+        out["alt_reduction_pct"] = row.get("alt_reduction_pct", "")
+        out["alt_duration"] = row.get("alt_duration", "")
+        out["mash_resolution_pct"] = row.get("mash_resolution_pct", "")
+        out["mash_duration"] = row.get("mash_duration", "")
+        out["company_name"] = row.get("sponsor", "")
+        out["source_url"] = row.get("url", "")
+        # carry forward all other columns
+        for k, v in row.items():
+            if k not in out and v:
+                out[k] = v
+        return out
+
+    slim = [remap_row(row) for row in combined]
     slim.sort(key=lambda r: (ALLOWED_SOURCES.index(r["source"])
                              if r["source"] in ALLOWED_SOURCES else 99,
                              r.get("trial_id", "")))
 
     master = os.path.join(outdir, f"{drug_slug}_ALL_REGISTRIES.xlsx")
     print("\nWriting combined master Excel ...", file=sys.stderr)
-    write_excel(slim, master, out_columns, sheet_name="All Registries")
+    write_excel(slim, master, FINAL_COLUMNS, sheet_name="All Registries")
 
     # ── summary ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 70, file=sys.stderr)

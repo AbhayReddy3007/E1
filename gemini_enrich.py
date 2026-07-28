@@ -65,30 +65,54 @@ NA = "INFO N/A"
 # columns this module appends, in order
 ENRICHED_COLUMNS = [
     "entire_trial_information",
-    "weight_reduction",
-    "hba1c_reduction",
-    "mash",
-    "alt_reduction",
+    "dosage",
+    "hba1c_change_pct",
+    "hba1c_duration",
+    "weight_change_pct",
+    "weight_duration",
+    "alt_reduction_pct",
+    "alt_duration",
+    "mash_resolution_pct",
+    "mash_duration",
 ]
 
 METRICS = {
-    "weight_reduction": (
-        "Weight reduction / body-weight change. Includes absolute weight loss "
-        "(kg, lb), percent body-weight change, BMI change, waist circumference "
-        "change, or weight-loss responder rates."
+    "hba1c_change_pct": (
+        "Percentage of HbA1c change (e.g. '-1.5 percentage points', '-1.8%'). "
+        "Report only the numeric change value with sign and unit."
     ),
-    "hba1c_reduction": (
-        "HbA1c (glycated haemoglobin, A1c) reduction or change, in percentage "
-        "points or mmol/mol, including HbA1c target-attainment rates."
+    "hba1c_duration": (
+        "The time period over which hba1c_change_pct was measured "
+        "(e.g. '26 weeks', '52 weeks', '6 months'). Report only the duration."
     ),
-    "mash": (
-        "MASH (metabolic dysfunction-associated steatohepatitis) or its former "
-        "name NASH, including MASH/NASH resolution, fibrosis improvement, "
-        "steatosis, liver fat fraction, or MASLD/NAFLD outcomes."
+    "weight_change_pct": (
+        "Percentage of body weight change (e.g. '-15.2%', '-20.9%'). "
+        "Report only the numeric percent change value with sign."
     ),
-    "alt_reduction": (
-        "ALT (alanine aminotransferase / SGPT) reduction or change, in U/L or "
-        "IU/L, or ALT normalisation rates."
+    "weight_duration": (
+        "The time period over which weight_change_pct was measured "
+        "(e.g. '68 weeks', '72 weeks', '1 year'). Report only the duration."
+    ),
+    "alt_reduction_pct": (
+        "Percentage or absolute change in ALT (alanine aminotransferase / SGPT), "
+        "e.g. '-40%', 'decreased from 54 to 28 U/L'. Report the change value."
+    ),
+    "alt_duration": (
+        "The time period over which alt_reduction_pct was measured "
+        "(e.g. '24 weeks', '52 weeks'). Report only the duration."
+    ),
+    "mash_resolution_pct": (
+        "Percentage of patients achieving MASH/NASH resolution, or fibrosis "
+        "improvement rate. E.g. '59% achieved MASH resolution'. Report the percentage."
+    ),
+    "mash_duration": (
+        "The time period over which mash_resolution_pct was measured "
+        "(e.g. '52 weeks', '72 weeks'). Report only the duration."
+    ),
+    "dosage": (
+        "Drug dosage / dose amounts mentioned in the trial "
+        "(e.g. '1 mg once weekly', '2.4 mg subcutaneous', '14 mg oral daily'). "
+        "Include all doses and arms if multiple are mentioned."
     ),
 }
 
