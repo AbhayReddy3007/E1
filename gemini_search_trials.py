@@ -191,11 +191,9 @@ for these {len(trial_batch)} {drug} trials from {reg['name']}:
 
 {trial_list}
 
-DATA SOURCES (search ALL):
-1. {reg['name']} - {reg['url']}
-2. PubMed/published papers linked to the trial
-3. ClinicalTrials.gov (cross-reference if trial is also registered there)
-4. WHO ICTRP - https://trialsearch.who.int/
+DATA SOURCE: {reg['name']} - {reg['url']}
+Go to the registry page for each trial ID and extract data ONLY from that page.
+Do NOT use PubMed, other registries, or any other source.
 
 For EACH trial, extract ALL of these fields:
 - trial_id: The registry ID

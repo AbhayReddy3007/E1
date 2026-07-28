@@ -56,7 +56,9 @@ import ctgov_trials
 import ctri_trials
 import euct_trials
 import gemini_enrich
+import gemini_fill_columns
 import gemini_search_trials
+import efficacy_scorer
 import ictrp_trials
 import jrct_trials
 import rebec_trials
@@ -410,7 +412,7 @@ def main() -> int:
         "mash_duration",
         "company_name",
         "source_url",
-        # keep all other columns after the primary ones
+        "efficacy_score",
     ]
 
     def remap_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -419,14 +421,13 @@ def main() -> int:
         out["trial_id"] = row.get("trial_id", "")
         out["dosage"] = row.get("dosage", "")
         out["phase"] = normalise_phase(row.get("phase", ""))
-        out["trial_title"] = row.get("title") or row.get("public_title", "")
-        out["trial_study_type"] = row.get("study_type", "")
-        out["trial_size"] = (row.get("actual_enrollment")
-                             or row.get("target_enrollment", ""))
-        out["trial_location"] = row.get("countries", "")
-        out["trial_start_date"] = row.get("start_date", "")
-        out["trial_completion_date"] = row.get("completion_date", "")
-        out["phase_status"] = row.get("status", "")
+        out["trial_title"] = row.get("trial_title", "") or row.get("title", "") or row.get("public_title", "")
+        out["trial_study_type"] = row.get("trial_study_type", "") or row.get("study_type", "")
+        out["trial_size"] = row.get("trial_size", "") or row.get("actual_enrollment", "") or row.get("target_enrollment", "")
+        out["trial_location"] = row.get("trial_location", "") or row.get("countries", "")
+        out["trial_start_date"] = row.get("trial_start_date", "") or row.get("start_date", "")
+        out["trial_completion_date"] = row.get("trial_completion_date", "") or row.get("completion_date", "")
+        out["phase_status"] = row.get("phase_status", "") or row.get("status", "")
         out["hba1c_change_pct"] = row.get("hba1c_change_pct", "")
         out["hba1c_duration"] = row.get("hba1c_duration", "")
         out["weight_change_pct"] = row.get("weight_change_pct", "")
@@ -435,11 +436,35 @@ def main() -> int:
         out["alt_duration"] = row.get("alt_duration", "")
         out["mash_resolution_pct"] = row.get("mash_resolution_pct", "")
         out["mash_duration"] = row.get("mash_duration", "")
-        out["company_name"] = row.get("sponsor", "")
-        out["source_url"] = row.get("url", "")
+        out["company_name"] = row.get("company_name", "") or row.get("sponsor", "")
+        out["source_url"] = row.get("source_url", "") or row.get("url", "")
+        out["efficacy_score"] = row.get("efficacy_score", "")
         return out
 
-    slim = [remap_row(row) for row in combined]
+    # ── Gemini: fill missing columns using trial_id + source_url ─────────────
+    gemini_key = (getattr(args, "metrics_key", None)
+                  or os.environ.get("GEMINI_API_KEY", "").strip())
+    if gemini_key:
+        # First remap so Gemini sees the correct field names
+        pre_rows = [remap_row(row) for row in combined]
+        print(f"\n[Gemini fill] Filling columns for {len(pre_rows)} trials "
+              f"using trial_id + source_url ...", file=sys.stderr)
+        gemini_fill_columns.fill_columns(
+            args.drug, pre_rows, api_key=gemini_key,
+            model=getattr(args, "metrics_model",
+                          getattr(args, "gemini_model",
+                                  gemini_fill_columns.DEFAULT_MODEL)),
+            workers=3,
+        )
+        # Compute efficacy score
+        print(f"  [Efficacy] Scoring {len(pre_rows)} trials ...", file=sys.stderr)
+        efficacy_scorer.add_efficacy_column(pre_rows)
+        slim = pre_rows
+    else:
+        print("\n[Gemini fill] no GEMINI_API_KEY – columns filled from "
+              "registry data only.", file=sys.stderr)
+        slim = [remap_row(row) for row in combined]
+        efficacy_scorer.add_efficacy_column(slim)
     slim.sort(key=lambda r: (ALLOWED_SOURCES.index(r["source"])
                              if r["source"] in ALLOWED_SOURCES else 99,
                              r.get("trial_id", "")))
