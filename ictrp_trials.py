@@ -156,33 +156,84 @@ def fetch(drug: str, max_records: Optional[int] = None,
     canonical source names (e.g. [SRC_CHICTR]) so this can back-fill a single
     registry without duplicating ones already fetched directly.
     """
-    session = make_session({"Accept": "application/xml, text/xml, */*"})
+    session = make_session({"Accept": "application/xml, text/xml, text/csv, */*"})
     rows: List[Dict[str, Any]] = []
 
-    # Try both the old and new ICTRP endpoints
+    # Try XML export, then CSV export as fallback
     xml_text = None
+    csv_text = None
     attempts = [
-        (EXPORT_URL, {"SearchTermStat": drug, "ExportMethod": "XML",
-                      "SearchTermFlag": "1"}),
-        ("https://trialsearch.who.int/Trial3.aspx",
+        ("xml", EXPORT_URL, {"SearchTermStat": drug, "ExportMethod": "XML",
+                             "SearchTermFlag": "1"}),
+        ("xml", "https://trialsearch.who.int/AdvSearch.aspx",
          {"SearchTermStat": drug, "ExportMethod": "XML",
-          "SearchTermFlag": "1"}),
-        ("https://trialsearch.who.int/api/Trial/Search",
-         {"query": drug, "format": "xml"}),
+          "SearchTermFlag": "1", "recruitmentStat": "ALL"}),
+        ("csv", EXPORT_URL, {"SearchTermStat": drug, "ExportMethod": "CSV",
+                             "SearchTermFlag": "1"}),
     ]
-    for url, params in attempts:
+    for fmt, url, params in attempts:
         try:
-            xml_text = http_get(session, url, params=params)
-            if xml_text and xml_text.strip().startswith("<"):
+            resp = http_get(session, url, params=params)
+            if not resp or len(resp.strip()) < 50:
+                continue
+            if fmt == "xml" and resp.strip().startswith("<"):
+                xml_text = resp
                 break
-            xml_text = None
+            elif fmt == "csv" and ("TrialID" in resp or "Source_Register" in resp):
+                csv_text = resp
+                break
         except Exception:
             continue
-    if xml_text is None:
+
+    if xml_text is None and csv_text is None:
         print("  [ICTRP] all search endpoints failed or returned HTML.",
               file=sys.stderr)
         return rows
 
+    # CSV path
+    if csv_text and not xml_text:
+        import csv as csv_mod, io
+        reader = csv_mod.DictReader(io.StringIO(csv_text))
+        for rec in reader:
+            tid = clean(rec.get("TrialID") or rec.get("trial_id", ""))
+            reg = clean(rec.get("Source_Register") or rec.get("register", ""))
+            source = canonical_source(reg, tid)
+            if source is None:
+                continue
+            if only_sources and source not in only_sources:
+                continue
+            row = blank_row(source)
+            row.update({
+                "trial_id": tid,
+                "title": first_nonempty(clean(rec.get("Scientific_title", "")),
+                                        clean(rec.get("Public_title", ""))),
+                "public_title": clean(rec.get("Public_title", "")),
+                "status": clean(rec.get("Recruitment_Status", "")),
+                "phase": clean(rec.get("Phase", "")),
+                "study_type": clean(rec.get("Study_type", "")),
+                "conditions": clean(rec.get("Condition", "")),
+                "interventions": clean(rec.get("Intervention", "")),
+                "drug_names": clean(rec.get("Intervention", "")),
+                "sponsor": clean(rec.get("Primary_sponsor", "")),
+                "countries": clean(rec.get("Countries", "")),
+                "target_enrollment": clean(rec.get("Target_size", "")),
+                "start_date": clean(rec.get("Date_enrollement", "")),
+                "registration_date": clean(rec.get("Date_registration", "")),
+                "last_updated": clean(rec.get("Last_Refreshed_on", "")),
+                "results_available": clean(rec.get("results_yes_no", "")),
+                "url": first_nonempty(clean(rec.get("web_address", "")),
+                                      PORTAL_URL.format(tid=tid)),
+            })
+            for k, v in rec.items():
+                col = "ictrp." + clean(k).replace(" ", "_")[:80]
+                if col not in row and clean(v):
+                    row[col] = clean(v)
+            rows.append(row)
+            if max_records and len(rows) >= max_records:
+                break
+        return rows
+
+    # XML path
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:

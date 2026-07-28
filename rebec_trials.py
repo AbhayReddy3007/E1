@@ -27,7 +27,8 @@ from registry_common import (
 
 # Canonical domain – no www prefix
 BASE = "https://ensaiosclinicos.gov.br"
-SEARCH_URL = BASE + "/rg"
+# /rg no longer has a search; /list shows all trials, /rg/RBR-xxx for detail
+SEARCH_URL = BASE + "/list"
 TRIAL_URL = BASE + "/rg/{rbr}"
 TRIAL_XML = BASE + "/rg/{rbr}/xml/ictrp"
 
@@ -41,8 +42,22 @@ def _search_ids(drug: str, session, max_records: Optional[int]) -> List[str]:
     page = 1
     while True:
         try:
-            html = http_get(session, SEARCH_URL,
-                            params={"q": drug, "page": str(page)})
+            # Try /list with search param, then /rg as legacy fallback
+            html = None
+            for url, params in [
+                (SEARCH_URL, {"q": drug, "page": str(page)}),
+                (BASE + "/rg", {"q": drug, "page": str(page)}),
+                (BASE + "/search", {"q": drug, "page": str(page)}),
+            ]:
+                try:
+                    html = http_get(session, url, params=params)
+                    if "RBR-" in html:
+                        break
+                except Exception:
+                    continue
+            if not html:
+                print(f"  [ReBEC] search failed on all URLs", file=sys.stderr)
+                break
         except Exception as exc:
             print(f"  [ReBEC] search failed: {exc}", file=sys.stderr)
             break
