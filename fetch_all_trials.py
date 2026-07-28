@@ -37,6 +37,13 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
 
+# Load .env file if python-dotenv is installed
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from registry_common import (
     ALLOWED_SOURCES, SRC_ANZCTR, SRC_CHICTR, SRC_CRIS, SRC_CTGOV, SRC_CTRI,
     SRC_EUCT, SRC_JRCT, SRC_REBEC, UNIFIED_COLUMNS, matches_drug, write_excel,
