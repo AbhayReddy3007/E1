@@ -2,22 +2,24 @@
 """
 jrct_trials.py – Japan Registry of Clinical Trials (jRCT).
 
-    Search : https://jrct.mhlw.go.jp/search
-    Trial  : https://jrct.mhlw.go.jp/en-latest-detail/<jRCT number>
+URL migration (March 25, 2025):
+  OLD: https://jrct.niph.go.jp/   (dead)
+  NEW: https://jrct.mhlw.go.jp/
+
+JPRN cross-search portal migration (March 25, 2025):
+  OLD: https://rctportal.niph.go.jp/  (dead)
+  NEW: https://rctportal.mhlw.go.jp/
+
+The public search page is at https://jrct.mhlw.go.jp/search (Japanese) or
+the English top page at https://jrct.mhlw.go.jp/en-top. The search form at
+/search accepts a POST with field 'freeword'. The detail pages at
+/en-latest-detail/<jRCT-id> are in English.
 
 >>> TERMS-OF-USE NOTICE <<<
-jRCT's site notice asks users NOT to perform bulk automated downloading
-beyond personal use ("Users are prohibited to download data through automatic
-programming beyond the scope of personal use").
-
-This module therefore:
-  * defaults to a conservative record cap (DEFAULT_CAP) unless you raise it,
-  * sleeps DELAY seconds between every request,
-  * runs single-threaded.
-
-Please keep your usage small and personal, or contact jRCT / use the JPRN
-portal (rctportal.mhlw.go.jp) for bulk needs. Set JRCT_DELAY to slow it
-further.
+jRCT's site asks users NOT to perform bulk automated downloading beyond
+personal use. This module sleeps DELAY seconds between requests and caps
+at DEFAULT_CAP records unless overridden. Set JRCT_DELAY env var to
+slow it further.
 """
 
 from __future__ import annotations
@@ -36,14 +38,11 @@ from registry_common import (
 )
 
 BASE = "https://jrct.mhlw.go.jp"
-JPRN = "https://rctportal.mhlw.go.jp"
-SEARCH_URL = BASE + "/search"
-# /en-search is gone since the 2025 URL migration; use JPRN portal
-EN_SEARCH_URL = JPRN + "/en/search"
+SEARCH_URL = BASE + "/search"       # Japanese search (POST freeword=)
 DETAIL_EN = BASE + "/en-latest-detail/{jid}"
 DETAIL_JA = BASE + "/latest-detail/{jid}"
 
-DEFAULT_CAP = 100                       # be a good citizen by default
+DEFAULT_CAP = 100
 DELAY = float(os.environ.get("JRCT_DELAY", "2.0"))
 JRCT_ID_RE = re.compile(r"(jRCT[a-zA-Z0-9]*\d{8,})", re.I)
 
@@ -51,49 +50,44 @@ JRCT_ID_RE = re.compile(r"(jRCT[a-zA-Z0-9]*\d{8,})", re.I)
 def _search_ids(drug: str, session, max_records: Optional[int]) -> List[str]:
     cap = max_records or DEFAULT_CAP
     ids: List[str] = []
-    seen = set()
+    seen: set = set()
 
-    for base_url, params in [
-        (EN_SEARCH_URL, {"freeword": drug}),
-        (JPRN + "/en/result", {"freeword": drug}),
-        (SEARCH_URL, {"freeword": drug}),
-    ]:
-        try:
-            html = http_get(session, base_url, params=params)
-        except Exception as exc:
-            print(f"  [jRCT] search failed on {base_url}: {exc}", file=sys.stderr)
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            m = JRCT_ID_RE.search(a["href"]) or JRCT_ID_RE.search(a.get_text())
-            if not m:
-                continue
+    def harvest(html: str):
+        for m in JRCT_ID_RE.finditer(html):
             jid = m.group(1)
-            if jid in seen:
-                continue
-            seen.add(jid)
-            ids.append(jid)
-            if len(ids) >= cap:
-                return ids
-        if ids:
-            break
-        time.sleep(DELAY)
+            if jid not in seen:
+                seen.add(jid)
+                ids.append(jid)
+                if len(ids) >= cap:
+                    return
 
-    if not ids:
-        # POST fallback – try jRCT Japanese search form
-        try:
-            html = http_post(session, SEARCH_URL,
-                             data={"freeword": drug})
-            for m in JRCT_ID_RE.finditer(html):
-                jid = m.group(1)
-                if jid not in seen:
-                    seen.add(jid)
-                    ids.append(jid)
-                    if len(ids) >= cap:
-                        break
-        except Exception as exc:
-            print(f"  [jRCT] POST fallback failed: {exc}", file=sys.stderr)
+    # Method 1: POST to /search with freeword
+    try:
+        html = http_post(session, SEARCH_URL,
+                         data={"freeword": drug})
+        harvest(html)
+        if ids:
+            return ids
+    except Exception as exc:
+        print(f"  [jRCT] POST search failed: {exc}", file=sys.stderr)
+
+    # Method 2: GET /search
+    try:
+        html = http_get(session, SEARCH_URL,
+                        params={"freeword": drug})
+        harvest(html)
+        if ids:
+            return ids
+    except Exception as exc:
+        print(f"  [jRCT] GET search failed: {exc}", file=sys.stderr)
+
+    # Method 3: GET /en-top page and extract any IDs present
+    try:
+        html = http_get(session, BASE + "/en-top",
+                        params={"freeword": drug})
+        harvest(html)
+    except Exception as exc:
+        print(f"  [jRCT] en-top search failed: {exc}", file=sys.stderr)
 
     return ids
 
@@ -104,8 +98,8 @@ def _map_detail(html: str, jid: str, url: str) -> Dict[str, Any]:
 
     row = blank_row(SRC_JRCT)
     row.update({
-        "trial_id": first_nonempty(find_field(pairs, "Trial ID", "研究計画書ID",
-                                              "jRCT ID"), jid),
+        "trial_id": first_nonempty(find_field(pairs, "Trial ID", "jRCT ID",
+                                              "研究計画書ID"), jid),
         "secondary_ids": join([find_field(pairs, "Secondary ID", "他の登録機関",
                                           "Other study ID"),
                                find_field(pairs, "Japic", "NCT")]),
@@ -114,18 +108,16 @@ def _map_detail(html: str, jid: str, url: str) -> Dict[str, Any]:
                        "Official title", "研究の名称"),
             find_field(pairs, "Title", "Public title")),
         "public_title": find_field(pairs, "Public title",
-                                   "Title for public disclosure",
-                                   "一般公開日"),
+                                   "Title for public disclosure"),
         "status": find_field(pairs, "Recruitment status", "Study status",
                              "募集状況", "進捗状況"),
-        "phase": find_field(pairs, "Phase", "Development phase", "試験のフェーズ"),
-        "study_type": find_field(pairs, "Study type", "研究の種類",
-                                 "Type of study"),
+        "phase": find_field(pairs, "Phase", "Development phase",
+                            "試験のフェーズ"),
+        "study_type": find_field(pairs, "Study type", "研究の種類"),
         "study_design": join([find_field(pairs, "Study design", "試験デザイン"),
                               find_field(pairs, "Allocation"),
                               find_field(pairs, "Blinding"),
-                              find_field(pairs, "Control"),
-                              find_field(pairs, "Institution")]),
+                              find_field(pairs, "Control")]),
         "conditions": join([find_field(pairs, "Health condition", "Condition",
                                        "対象疾患名"),
                             find_field(pairs, "Target disease")]),
@@ -139,17 +131,15 @@ def _map_detail(html: str, jid: str, url: str) -> Dict[str, Any]:
         "sponsor": join([find_field(pairs, "Name of lead principal investigator",
                                     "Sponsor", "研究責任医師"),
                          find_field(pairs, "Organization", "実施医療機関")]),
-        "sponsor_type": find_field(pairs, "Source of funding", "資金提供者",
-                                   "Funding source"),
-        "collaborators": join([find_field(pairs, "Collaborator"),
-                               find_field(pairs, "Organization of secondary")]),
-        "countries": first_nonempty(find_field(pairs, "Region", "実施国"), "Japan"),
+        "sponsor_type": find_field(pairs, "Source of funding", "資金提供者"),
+        "collaborators": find_field(pairs, "Collaborator"),
+        "countries": first_nonempty(find_field(pairs, "Region", "実施国"),
+                                    "Japan"),
         "sites": find_field(pairs, "Institution", "Name of institution",
                             "実施医療機関"),
         "target_enrollment": find_field(pairs, "Target sample size",
                                         "Planned sample size", "予定症例数"),
-        "actual_enrollment": find_field(pairs, "Actual sample size",
-                                        "Number of participants"),
+        "actual_enrollment": find_field(pairs, "Actual sample size"),
         "age_min": find_field(pairs, "Age minimum", "Age Minimum", "年齢下限"),
         "age_max": find_field(pairs, "Age maximum", "Age Maximum", "年齢上限"),
         "gender": find_field(pairs, "Gender", "Sex", "性別"),
@@ -173,18 +163,18 @@ def _map_detail(html: str, jid: str, url: str) -> Dict[str, Any]:
                                    "最終更新日"),
         "results_available": find_field(pairs, "Result posted", "Results",
                                         "結果の公表"),
-        "findings": join([find_field(pairs, "Summary of results", "Result summary",
-                                     "結果の概要"),
+        "findings": join([find_field(pairs, "Summary of results",
+                                     "Result summary", "結果の概要"),
                           find_field(pairs, "Primary outcome result"),
                           find_field(pairs, "Conclusion"),
                           find_field(pairs, "Publication", "公表論文")]),
         "contact": join([find_field(pairs, "Contact for public queries",
                                     "Contact person", "問合せ先"),
                          find_field(pairs, "E-mail", "Email")]),
-        "ethics_approval": join([find_field(pairs, "Name of certified review board",
-                                            "IRB", "認定臨床研究審査委員会"),
-                                 find_field(pairs, "Approval date",
-                                            "Date of approval")]),
+        "ethics_approval": join([
+            find_field(pairs, "Name of certified review board",
+                       "IRB", "認定臨床研究審査委員会"),
+            find_field(pairs, "Approval date", "Date of approval")]),
         "url": url,
     })
 
@@ -213,7 +203,8 @@ def fetch(drug: str, max_records: Optional[int] = None,
             try:
                 html = http_get(session, url)
             except Exception as exc:
-                print(f"  ! jRCT detail failed for {jid}: {exc}", file=sys.stderr)
+                print(f"  ! jRCT detail failed for {jid}: {exc}",
+                      file=sys.stderr)
                 continue
         rows.append(_map_detail(html, jid, url))
         if i % 10 == 0:

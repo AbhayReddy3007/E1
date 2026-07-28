@@ -2,14 +2,12 @@
 """
 rebec_trials.py – Registro Brasileiro de Ensaios Clínicos (ReBEC, Brazil).
 
-    Search    : https://ensaiosclinicos.gov.br/rg
-    Trial     : https://ensaiosclinicos.gov.br/rg/<RBR-id>
-    Trial XML : https://ensaiosclinicos.gov.br/rg/<RBR-id>/xml/ictrp
-    Full dump : https://ensaiosclinicos.gov.br/rg/all/xml/ictrp
+    Search : https://ensaiosclinicos.gov.br/rg?q=<drug>
+    Trial  : https://ensaiosclinicos.gov.br/rg/<RBR-id>
+    XML    : https://ensaiosclinicos.gov.br/rg/<RBR-id>/xml/ictrp
 
-ReBEC exposes each trial as an ICTRP-format XML document — effectively a
-free, key-less API. We use that as the primary route (all fields captured by
-flattening the XML) and fall back to the bilingual HTML page if XML fails.
+The canonical domain is ensaiosclinicos.gov.br (no www prefix).
+The /rg search accepts a ?q= GET parameter.
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus
 
 from bs4 import BeautifulSoup
 
@@ -27,44 +25,34 @@ from registry_common import (
     first_nonempty, flatten_xml, http_get, join, make_session, run_cli,
 )
 
-# ReBEC has used both these domains historically
-BASE_URLS = [
-    "https://ensaiosclinicos.gov.br",
-    "https://rebec.gov.br",
-    "http://www.ensaiosclinicos.gov.br",
-]
-BASE = BASE_URLS[0]
-SEARCH_URL = "{base}/rg"
-TRIAL_URL = "{base}/rg/{rbr}"
-TRIAL_XML = "{base}/rg/{rbr}/xml/ictrp"
-RBR_RE = re.compile(r"(RBR-[0-9a-z]+)", re.I)
+# Canonical domain – no www prefix
+BASE = "https://ensaiosclinicos.gov.br"
+SEARCH_URL = BASE + "/rg"
+TRIAL_URL = BASE + "/rg/{rbr}"
+TRIAL_XML = BASE + "/rg/{rbr}/xml/ictrp"
+
+RBR_RE = re.compile(r"(RBR-[0-9a-zA-Z]+)", re.I)
 DELAY = 1.0
 
 
 def _search_ids(drug: str, session, max_records: Optional[int]) -> List[str]:
-    global BASE
     ids: List[str] = []
-    seen = set()
+    seen: set = set()
     page = 1
     while True:
-        html = None
-        for base in BASE_URLS:
-            try:
-                html = http_get(session, SEARCH_URL.format(base=base),
-                                params={"q": drug, "page": str(page)})
-                BASE = base   # remember the working one
-                break
-            except Exception as exc:
-                if base == BASE_URLS[-1]:
-                    print(f"  [ReBEC] search failed on all URLs: {exc}",
-                          file=sys.stderr)
-        if html is None:
+        try:
+            html = http_get(session, SEARCH_URL,
+                            params={"q": drug, "page": str(page)})
+        except Exception as exc:
+            print(f"  [ReBEC] search failed: {exc}", file=sys.stderr)
             break
 
         soup = BeautifulSoup(html, "html.parser")
         hits = 0
         for a in soup.find_all("a", href=True):
             m = RBR_RE.search(a["href"])
+            if not m:
+                m = RBR_RE.search(a.get_text())
             if not m:
                 continue
             rbr = m.group(1).lower()
@@ -149,7 +137,7 @@ def _map_xml(xml_text: str, rbr: str) -> Optional[Dict[str, Any]]:
         "ethics_approval": join([g("ethics_review_status"),
                                  g("ethics_review_approval_date"),
                                  g("ethics_review_contact_name")]),
-        "url": TRIAL_URL.format(base=BASE, rbr=rbr),
+        "url": TRIAL_URL.format(rbr=rbr),
     })
 
     for k, v in flat.items():
@@ -165,35 +153,37 @@ def _map_html(html: str, rbr: str, url: str) -> Dict[str, Any]:
 
     row = blank_row(SRC_REBEC)
     row.update({
-        "trial_id": first_nonempty(find_field(pairs, "Trial identifying number",
-                                              "UTN", "Registration number"),
-                                   rbr.upper()),
+        "trial_id": first_nonempty(
+            find_field(pairs, "Trial identifying number", "UTN",
+                       "Registration number"), rbr.upper()),
         "secondary_ids": find_field(pairs, "Secondary identifying numbers",
                                     "Other identifying"),
-        "title": first_nonempty(find_field(pairs, "Scientific title",
-                                           "Título científico"),
-                                find_field(pairs, "Public title",
-                                           "Título público")),
+        "title": first_nonempty(
+            find_field(pairs, "Scientific title", "Título científico"),
+            find_field(pairs, "Public title", "Título público")),
         "public_title": find_field(pairs, "Public title", "Título público"),
-        "status": find_field(pairs, "Recruitment status", "Status de recrutamento"),
+        "status": find_field(pairs, "Recruitment status",
+                             "Status de recrutamento"),
         "phase": find_field(pairs, "Study phase", "Fase", "Phase"),
         "study_type": find_field(pairs, "Study type", "Tipo de estudo"),
         "study_design": join([find_field(pairs, "Study design", "Desenho"),
                               find_field(pairs, "Intervention assignment"),
                               find_field(pairs, "Masking", "Mascaramento")]),
-        "conditions": join([find_field(pairs, "Health condition", "Condição de saúde"),
-                            find_field(pairs, "General descriptors")]),
-        "interventions": find_field(pairs, "Interventions", "Intervenções",
-                                    "Intervention"),
+        "conditions": join([
+            find_field(pairs, "Health condition", "Condição de saúde"),
+            find_field(pairs, "General descriptors")]),
+        "interventions": find_field(pairs, "Interventions", "Intervenções"),
         "drug_names": find_field(pairs, "Interventions", "Intervention"),
-        "sponsor": find_field(pairs, "Primary sponsor", "Patrocinador principal"),
-        "sponsor_type": find_field(pairs, "Institution type", "Sponsor type"),
+        "sponsor": find_field(pairs, "Primary sponsor",
+                              "Patrocinador principal"),
+        "sponsor_type": find_field(pairs, "Institution type"),
         "collaborators": join([find_field(pairs, "Secondary sponsor"),
                                find_field(pairs, "Support source",
                                           "Fonte de financiamento")]),
-        "countries": first_nonempty(find_field(pairs, "Countries of recruitment"),
-                                    "Brazil"),
-        "sites": find_field(pairs, "Recruitment site", "Centro de recrutamento"),
+        "countries": first_nonempty(
+            find_field(pairs, "Countries of recruitment"), "Brazil"),
+        "sites": find_field(pairs, "Recruitment site",
+                            "Centro de recrutamento"),
         "target_enrollment": find_field(pairs, "Target sample size",
                                         "Tamanho da amostra"),
         "actual_enrollment": find_field(pairs, "Actual sample size"),
@@ -218,15 +208,16 @@ def _map_html(html: str, rbr: str, url: str) -> Dict[str, Any]:
                                         "Data de registro"),
         "last_updated": find_field(pairs, "Last update", "Última atualização"),
         "results_available": find_field(pairs, "Results", "Resultados"),
-        "findings": join([find_field(pairs, "Results summary", "Resumo dos resultados"),
+        "findings": join([find_field(pairs, "Results summary",
+                                     "Resumo dos resultados"),
                           find_field(pairs, "Conclusion", "Conclusão"),
                           find_field(pairs, "Publication")]),
         "contact": join([find_field(pairs, "Contact for public queries"),
                          find_field(pairs, "E-mail", "Email")]),
-        "ethics_approval": join([find_field(pairs, "Ethics committee",
-                                            "Comitê de ética"),
-                                 find_field(pairs, "Approval date"),
-                                 find_field(pairs, "CAAE")]),
+        "ethics_approval": join([
+            find_field(pairs, "Ethics committee", "Comitê de ética"),
+            find_field(pairs, "Approval date"),
+            find_field(pairs, "CAAE")]),
         "url": url,
     })
 
@@ -248,15 +239,17 @@ def fetch(drug: str, max_records: Optional[int] = None,
         row = None
         if details:
             try:
-                row = _map_xml(http_get(session, TRIAL_XML.format(base=BASE, rbr=rbr)), rbr)
+                row = _map_xml(http_get(session, TRIAL_XML.format(rbr=rbr)),
+                               rbr)
             except Exception:
                 row = None
         if row is None:
-            url = TRIAL_URL.format(base=BASE, rbr=rbr)
+            url = TRIAL_URL.format(rbr=rbr)
             try:
                 row = _map_html(http_get(session, url), rbr, url)
             except Exception as exc:
-                print(f"  ! ReBEC detail failed for {rbr}: {exc}", file=sys.stderr)
+                print(f"  ! ReBEC detail failed for {rbr}: {exc}",
+                      file=sys.stderr)
                 continue
         rows.append(row)
         if i % 10 == 0:
