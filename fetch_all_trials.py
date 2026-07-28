@@ -77,7 +77,6 @@ REGISTRIES: Dict[str, tuple] = {
     "jrct":    (SRC_JRCT,   jrct_trials.fetch,   "jrct"),
     "anzctr":  (SRC_ANZCTR, anzctr_trials.fetch, "anzctr"),
     "cris":    (SRC_CRIS,   cris_trials.fetch,   "cris"),
-    "rebec":   (SRC_REBEC,  rebec_trials.fetch,  "rebec"),
 }
 
 
