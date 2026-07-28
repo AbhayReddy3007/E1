@@ -49,6 +49,7 @@ import ctgov_trials
 import ctri_trials
 import euct_trials
 import gemini_enrich
+import gemini_search_trials
 import ictrp_trials
 import jrct_trials
 import rebec_trials
@@ -249,6 +250,35 @@ def main() -> int:
                                                 meta["source"])
                 meta["via_ictrp"] = True
 
+    # Gemini Search fallback for registries still empty after ICTRP
+    still_missing = [results[k]["source"] for k in results
+                     if not results[k]["rows"]
+                     and results[k]["source"] not in (SRC_CTGOV, SRC_EUCT)]
+    if still_missing:
+        gemini_key = (getattr(args, "metrics_key", None)
+                      or getattr(args, "gemini_key", None)
+                      or os.environ.get("GEMINI_API_KEY", "").strip())
+        if gemini_key:
+            print(f"\n[Gemini search fallback] searching {len(still_missing)} "
+                  f"registry(ies) via Gemini + Google Search ...",
+                  file=sys.stderr)
+            gemini_recovered = gemini_search_trials.search_missing_registries(
+                args.drug, still_missing, api_key=gemini_key,
+                model=getattr(args, "metrics_model",
+                              getattr(args, "gemini_model",
+                                      gemini_search_trials.DEFAULT_MODEL)),
+            )
+            for key, meta in results.items():
+                src = meta["source"]
+                if not meta["rows"] and src in gemini_recovered and gemini_recovered[src]:
+                    meta["rows"] = _enforce_sources(gemini_recovered[src], src)
+                    meta["via_gemini_search"] = True
+                    print(f"  [Gemini search] recovered {len(meta['rows'])} "
+                          f"row(s) for {src}", file=sys.stderr)
+        else:
+            print(f"\n[Gemini search fallback] {len(still_missing)} registries "
+                  f"still empty but no GEMINI_API_KEY set.", file=sys.stderr)
+
     # strict drug filter
     if args.strict:
         for meta in results.values():
@@ -353,7 +383,8 @@ def main() -> int:
     print("=" * 70, file=sys.stderr)
     for key in keys:
         meta = results.get(key, {})
-        note = "  (via WHO ICTRP)" if meta.get("via_ictrp") else ""
+        note = "  (via WHO ICTRP)" if meta.get("via_ictrp") else \
+               "  (via Gemini Search)" if meta.get("via_gemini_search") else ""
         print(f"  {meta.get('source', key):<22} {len(meta.get('rows', [])):>6} "
               f"trial(s){note}", file=sys.stderr)
     print(f"  {'TOTAL':<22} {len(slim):>6} trial(s)", file=sys.stderr)
