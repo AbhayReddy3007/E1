@@ -437,10 +437,6 @@ def main() -> int:
         out["mash_duration"] = row.get("mash_duration", "")
         out["company_name"] = row.get("sponsor", "")
         out["source_url"] = row.get("url", "")
-        # carry forward all other columns
-        for k, v in row.items():
-            if k not in out and v:
-                out[k] = v
         return out
 
     slim = [remap_row(row) for row in combined]
