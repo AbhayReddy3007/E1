@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -76,6 +77,83 @@ GEMINI_FIELD_MAP = {
     "Company": "company_name",
     "Source URL": "source_url",
 }
+
+
+# The only columns that should appear in the final output, in this order.
+FINAL_COLUMNS = [
+    "molecule_name",
+    "dosage",
+    "phase",
+    "trial_title",
+    "trial_study_type",
+    "trial_size",
+    "trial_location",
+    "trial_start_date",
+    "trial_completion_date",
+    "phase_status",
+    "hba1c_change_pct",
+    "hba1c_duration",
+    "weight_change_pct",
+    "weight_duration",
+    "alt_reduction_pct",
+    "alt_duration",
+    "mash_resolution_pct",
+    "mash_duration",
+    "company_name",
+    "source_url",
+]
+
+
+def normalise_phase(raw: str) -> str:
+    """Normalise 'Phase III', 'PHASE3', 'Phase 2/3', etc. down to '1'/'2'/'3'/'4'
+    (or '2/3' style for combined phases)."""
+    if not raw:
+        return ""
+    s = re.sub(r"(?i)\bphase\s*", "phase ", str(raw))
+    phase_map = {
+        "one": "1", "two": "2", "three": "3", "four": "4",
+        "i": "1", "ii": "2", "iii": "3", "iv": "4",
+        "1": "1", "2": "2", "3": "3", "4": "4",
+    }
+    nums = []
+    for tok in re.split(r"[/,;\s]+", s.lower()):
+        tok = tok.strip("(). ")
+        if tok in phase_map and phase_map[tok] not in nums:
+            nums.append(phase_map[tok])
+    return "/".join(nums) if nums else str(raw).strip()
+
+
+def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
+    """Collapse a merged ctgov+Gemini row down to exactly FINAL_COLUMNS.
+
+    Falls back to the raw ctgov_trials.py field name (e.g. 'title',
+    'countries', 'status') if the Gemini-named field wasn't filled in.
+    """
+    return {
+        "molecule_name": drug,
+        "dosage": row.get("dosage", ""),
+        "phase": normalise_phase(row.get("phase", "")),
+        "trial_title": row.get("trial_title", "") or row.get("title", "")
+                        or row.get("public_title", ""),
+        "trial_study_type": row.get("trial_study_type", "") or row.get("study_type", ""),
+        "trial_size": row.get("trial_size", "") or row.get("actual_enrollment", "")
+                      or row.get("target_enrollment", ""),
+        "trial_location": row.get("trial_location", "") or row.get("countries", ""),
+        "trial_start_date": row.get("trial_start_date", "") or row.get("start_date", ""),
+        "trial_completion_date": row.get("trial_completion_date", "")
+                                  or row.get("completion_date", ""),
+        "phase_status": row.get("phase_status", "") or row.get("status", ""),
+        "hba1c_change_pct": row.get("hba1c_change_pct", ""),
+        "hba1c_duration": row.get("hba1c_duration", ""),
+        "weight_change_pct": row.get("weight_change_pct", ""),
+        "weight_duration": row.get("weight_duration", ""),
+        "alt_reduction_pct": row.get("alt_reduction_pct", ""),
+        "alt_duration": row.get("alt_duration", ""),
+        "mash_resolution_pct": row.get("mash_resolution_pct", ""),
+        "mash_duration": row.get("mash_duration", ""),
+        "company_name": row.get("company_name", "") or row.get("sponsor", ""),
+        "source_url": row.get("source_url", "") or row.get("url", ""),
+    }
 
 
 def _to_gemini_trial_stub(row: Dict[str, Any]) -> Dict[str, str]:
@@ -176,18 +254,20 @@ def main() -> int:
         print("No trials found / enriched.", file=sys.stderr)
         return 1
 
+    final_rows = [remap_row(row, args.drug) for row in rows]
+
     os.makedirs(args.outdir, exist_ok=True)
     drug_slug = args.drug.lower().replace(" ", "_")
     out_path = os.path.join(args.outdir, f"{drug_slug}_ctgov_gemini_enriched.xlsx")
 
     if write_excel is not None:
-        columns = list(rows[0].keys())
-        write_excel(rows, out_path, columns, sheet_name="ClinicalTrials.gov + Gemini")
+        write_excel(final_rows, out_path, FINAL_COLUMNS,
+                    sheet_name="ClinicalTrials.gov + Gemini")
     else:
         import pandas as pd
-        pd.DataFrame(rows).to_excel(out_path, index=False)
+        pd.DataFrame(final_rows, columns=FINAL_COLUMNS).to_excel(out_path, index=False)
 
-    print(f"\nWrote {len(rows)} enriched trial(s) to {out_path}")
+    print(f"\nWrote {len(final_rows)} enriched trial(s) to {out_path}")
     return 0
 
 
