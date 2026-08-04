@@ -61,7 +61,7 @@ from gemini_extractor import (
 # into one Gemini call measurably dilutes how much research depth each
 # individual trial gets. We don't touch the imported BATCH_SIZE constant
 # since other callers of gemini_extractor.py may rely on it.
-FIRST_PASS_BATCH_SIZE = 4
+FIRST_PASS_BATCH_SIZE = 2
 
 # Batch size for the automatic retry pass on trials that came back with no
 # efficacy data — one trial per call, so the model can spend its full
@@ -83,12 +83,51 @@ def _efficacy_missing(row: Dict[str, Any]) -> bool:
     return not any(str(row.get(f, "")).strip() for f in EFFICACY_ROW_FIELDS)
 
 
+# Core, non-efficacy fields that the registry scraper OR Gemini should
+# normally be able to fill in. Unlike EFFICACY_ROW_FIELDS (which can be
+# legitimately empty — no results published yet), these are almost always
+# obtainable, so a row missing any of them is also worth a retry pass rather
+# than being accepted as final.
+CORE_ROW_FIELDS = [
+    "trial_title", "phase", "trial_size", "trial_location",
+    "phase_status", "trial_start_date",
+]
+
+
+def _core_fields_missing(row: Dict[str, Any]) -> bool:
+    """True if any core (non-efficacy) required field is still empty."""
+    return any(not str(row.get(f, "")).strip() for f in CORE_ROW_FIELDS)
+
+
+def _needs_retry(row: Dict[str, Any]) -> bool:
+    """A row is a Pass-2 retry candidate if it's missing efficacy data OR
+    missing a core field that should normally be recoverable."""
+    return _efficacy_missing(row) or _core_fields_missing(row)
+
+
 # ---------------------------------------------------------------------------
-# Pre-fetch: hit each trial's registry URL before sending to Gemini so we
-# can feed the raw page text (especially the results section) directly into
-# the prompt. This saves Gemini a search call per trial and gives it data
-# that Google Search sometimes can't reach (dynamic JS-rendered results
-# tabs, pages behind cookie walls, etc.).
+# Pre-fetch: pull real page/registry content for each trial before sending
+# to Gemini, so we can feed dense, verified text (especially the results
+# section) directly into the prompt instead of relying only on a search call
+# per trial.
+#
+# IMPORTANT: clinicaltrials.gov's public site is a JavaScript SPA — a plain
+# HTTP GET of the study page returns mostly navigation chrome, not the
+# study/results content, because that's loaded client-side after the page
+# boots. Scraping that HTML with regex silently produced near-empty or junk
+# text for the majority of CT.gov trials while still being labeled the "most
+# reliable source" in the prompt. CT.gov also happens to publish a real JSON
+# API (v2) with the full protocol AND results sections, so for NCT-prefixed
+# trials we use that instead of HTML scraping — it is both more reliable and
+# cheaper than trying to parse rendered HTML.
+#
+# For non-CT.gov registries (EU CTIS / EudraCT) we don't have a documented
+# public JSON API here, so we still fall back to fetching the HTML page, but
+# with two fixes: (1) HTML tags are stripped BEFORE we search for a results
+# section, since regexes like `Study\s+Results` never matched across tag
+# boundaries in raw markup; (2) pages that look like an empty/near-empty SPA
+# shell are detected and dropped rather than passed to Gemini as if they were
+# real content.
 # ---------------------------------------------------------------------------
 
 # How many registry pages to fetch concurrently.
@@ -102,126 +141,236 @@ PREFETCH_MAX_CHARS = 6000
 # one hangs we don't want to block the whole pipeline.
 PREFETCH_TIMEOUT = 20
 
-# Sections / keywords we try to isolate from the fetched HTML. If we find
-# a results section we prefer that over the full page — it's denser and
-# more relevant.
-_RESULTS_SECTION_PATTERNS = [
-    # CT.gov results tab content
-    re.compile(r"(?si)(Study\s+Results.*?)(?=<footer|<div[^>]*id=[\"']footer|$)"),
-    # CT.gov outcome measures
-    re.compile(r"(?si)(Primary\s+Outcome\s+Measures?.*?)(?=Secondary\s+Outcome|<footer|$)"),
-    re.compile(r"(?si)(Secondary\s+Outcome\s+Measures?.*?)(?=<footer|$)"),
-    # EU CTIS results
-    re.compile(r"(?si)(Results\s+information.*?)(?=<footer|$)"),
-    # Generic "results" heading
-    re.compile(r"(?si)(<h[1-4][^>]*>.*?results.*?</h[1-4]>.*?)(?=<footer|$)"),
+# CT.gov API v2 fields needed to reconstruct a results-bearing text block.
+_CTGOV_API_FIELDS = (
+    "NCTId,BriefTitle,OfficialTitle,OverallStatus,Phase,EnrollmentCount,"
+    "StartDateStruct,PrimaryCompletionDateStruct,LeadSponsorName,"
+    "HasResults,OutcomeMeasureList"
+)
+
+# Keywords used (on already tag-stripped plain text) to find and window
+# around the parts of an HTML page most likely to hold efficacy data.
+# Operating on plain text avoids the tag-boundary-matching problem that a
+# raw-HTML regex like `Study\s+Results` has.
+_RESULT_KEYWORDS = [
+    "study results", "results information", "primary outcome",
+    "secondary outcome", "outcome measure", "hba1c", "weight loss",
+    "weight change", "alt reduction", "mash resolution", "nash resolution",
+    "change from baseline", "trial results", "efficacy",
 ]
+
+# Markers that indicate we've been handed an SPA loading shell rather than
+# real content (e.g. "Loading...", empty Angular root divs, cookie-consent
+# only pages). If the tag-stripped text is short AND matches one of these,
+# we discard it instead of forwarding near-empty text to Gemini as if it
+# were reliable page content.
+_SPA_SHELL_MARKERS = re.compile(
+    r"(?i)\b(loading\.\.\.|please enable javascript|enable\s+javascript|"
+    r"just a moment|checking your browser|access denied|cookie(s)? consent)\b"
+)
+_SPA_SHELL_MIN_CHARS = 300
+
+
+def _strip_html_tags(html: str) -> str:
+    """Strip script/style blocks and tags, decode common entities, collapse
+    whitespace. Operates on the FULL page first so keyword search afterward
+    isn't broken by tags sitting between words that belong together in the
+    rendered text."""
+    if not html:
+        return ""
+    text = re.sub(r"(?si)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = (text
+            .replace("&amp;", "&").replace("&lt;", "<")
+            .replace("&gt;", ">").replace("&nbsp;", " ")
+            .replace("&#8209;", "-").replace("&#39;", "'")
+            .replace("&quot;", '"'))
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _extract_page_text(html: str, max_chars: int = PREFETCH_MAX_CHARS) -> str:
     """Extract useful text from registry page HTML.
 
-    Tries to isolate the results section first; falls back to the full
-    page body. Strips HTML tags and collapses whitespace.
+    Strips tags first (so keyword matching works across what used to be tag
+    boundaries), detects SPA loading shells and returns "" for them instead
+    of passing near-empty/misleading content downstream, and — if the page
+    is long — keeps windows AROUND result-related keywords rather than
+    blindly keeping only the head and tail of the document (which can throw
+    away a results table sitting in the middle of the page).
     """
     if not html:
         return ""
 
-    # Try to find a results-specific section first
-    results_text = ""
-    for pattern in _RESULTS_SECTION_PATTERNS:
-        m = pattern.search(html)
-        if m:
-            results_text = m.group(1)
-            break
+    text = _strip_html_tags(html)
 
-    # Use results section if found, otherwise fall back to <body> or full HTML
-    if results_text:
-        text_source = results_text
-    else:
-        # Extract body content
-        body_match = re.search(r"(?si)<body[^>]*>(.*?)</body>", html)
-        text_source = body_match.group(1) if body_match else html
+    if len(text) < _SPA_SHELL_MIN_CHARS and _SPA_SHELL_MARKERS.search(text):
+        return ""
+    if len(text) < 100:
+        # Too short to be a real study page regardless of markers.
+        return ""
 
-    # Strip script/style blocks
-    text_source = re.sub(r"(?si)<(script|style|noscript)[^>]*>.*?</\1>", " ", text_source)
-    # Strip HTML tags
-    text_source = re.sub(r"<[^>]+>", " ", text_source)
-    # Decode common HTML entities
-    text_source = (text_source
-                   .replace("&amp;", "&").replace("&lt;", "<")
-                   .replace("&gt;", ">").replace("&nbsp;", " ")
-                   .replace("&#8209;", "-").replace("&#39;", "'")
-                   .replace("&quot;", '"'))
-    # Collapse whitespace
-    text_source = re.sub(r"\s+", " ", text_source).strip()
+    if len(text) <= max_chars:
+        return text
 
-    if len(text_source) > max_chars:
-        # Keep the beginning (trial metadata) and the end (often has
-        # results/outcome data) with a marker in the middle.
-        half = max_chars // 2
-        text_source = (text_source[:half]
-                       + " [...PAGE TRUNCATED...] "
-                       + text_source[-half:])
+    lower = text.lower()
+    window = 900  # chars of context kept on each side of a keyword hit
+    spans: List[tuple] = []
+    for kw in _RESULT_KEYWORDS:
+        start = 0
+        while True:
+            idx = lower.find(kw, start)
+            if idx == -1:
+                break
+            spans.append((max(0, idx - window), min(len(text), idx + len(kw) + window)))
+            start = idx + len(kw)
 
-    return text_source
+    if spans:
+        # Merge overlapping windows, keep in document order.
+        spans.sort()
+        merged: List[list] = []
+        for s, e in spans:
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        pieces = [text[s:e] for s, e in merged]
+        combined = " [...] ".join(pieces)
+        if len(combined) > max_chars:
+            combined = combined[:max_chars]
+        # Always keep a short head so trial identity/metadata isn't lost.
+        head = text[:400]
+        if not combined.startswith(head[:100]):
+            combined = head + " [...] " + combined
+        return combined[:max_chars]
+
+    # No keyword hits found anywhere — fall back to head+tail, but flag it
+    # clearly so the prompt-side logic doesn't over-trust this text.
+    half = max_chars // 2
+    return text[:half] + " [...PAGE TRUNCATED, NO RESULTS KEYWORDS FOUND...] " + text[-half:]
+
+
+async def _fetch_ctgov_api_text(nct_id: str, session: aiohttp.ClientSession) -> str:
+    """Pull a results-bearing text block for an NCT trial from CT.gov's real
+    JSON API (v2), instead of scraping the JS-rendered HTML page which does
+    not contain the results content in its initial response."""
+    url = f"https://clinicaltrials.gov/api/v2/studies/{nct_id}"
+    try:
+        async with session.get(url, params={"fields": _CTGOV_API_FIELDS},
+                                timeout=aiohttp.ClientTimeout(total=PREFETCH_TIMEOUT)) as resp:
+            if resp.status != 200:
+                return ""
+            data = await resp.json()
+    except Exception as exc:
+        print(f"    [prefetch] {nct_id}: CT.gov API {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return ""
+
+    protocol = data.get("protocolSection", {}) if isinstance(data, dict) else {}
+    ident = protocol.get("identificationModule", {})
+    status = protocol.get("statusModule", {})
+    sponsor = protocol.get("sponsorCollaboratorsModule", {})
+    outcomes = protocol.get("outcomesModule", {})
+    has_results = bool(data.get("hasResults")) if isinstance(data, dict) else False
+
+    parts = [
+        f"Official Title: {ident.get('officialTitle', '')}",
+        f"Overall Status: {status.get('overallStatus', '')}",
+        f"Lead Sponsor: {sponsor.get('leadSponsor', {}).get('name', '')}",
+        f"Has Results Posted: {has_results}",
+    ]
+    for om in outcomes.get("primaryOutcomes", []) or []:
+        parts.append(f"Primary Outcome Measure: {om.get('measure', '')} — {om.get('description', '')}")
+    for om in outcomes.get("secondaryOutcomes", []) or []:
+        parts.append(f"Secondary Outcome Measure: {om.get('measure', '')} — {om.get('description', '')}")
+
+    results_section = data.get("resultsSection", {}) if isinstance(data, dict) else {}
+    if results_section:
+        outcome_measures = results_section.get("outcomeMeasuresModule", {}).get("outcomeMeasures", [])
+        for om in outcome_measures:
+            title = om.get("title", "")
+            om_type = om.get("type", "")
+            desc = om.get("description", "")
+            parts.append(f"Reported Outcome ({om_type}): {title} — {desc}")
+            for group in om.get("classes", []):
+                for cat in group.get("categories", []):
+                    for measurement in cat.get("measurements", []):
+                        parts.append(
+                            f"  Group {measurement.get('groupId', '')}: "
+                            f"{measurement.get('value', '')} {om.get('unitOfMeasure', '')}"
+                        )
+
+    text = "\n".join(p for p in parts if p and not p.endswith(": ") and not p.endswith("— "))
+    return text[:PREFETCH_MAX_CHARS]
 
 
 async def _prefetch_registry_pages(
     rows: List[Dict[str, Any]],
 ) -> Dict[str, str]:
-    """Fetch registry page content for each trial that has a URL.
+    """Fetch supporting content for each trial that has a trial ID / URL.
 
-    Returns a dict mapping trial_id -> extracted page text.
-    Only fetches pages that have a plausible registry URL (http/https).
+    Returns a dict mapping trial_id -> extracted text. NCT-prefixed trials
+    use CT.gov's structured JSON API (reliable, includes results); other
+    trials fall back to fetching and text-extracting their registry URL.
     """
-    url_map: Dict[str, str] = {}  # trial_id -> url
+    ctgov_ids: List[str] = []
+    html_url_map: Dict[str, str] = {}  # trial_id -> url
     for row in rows:
         tid = row.get("trial_id", "")
+        if not tid:
+            continue
+        if _is_ctgov_id(tid):
+            ctgov_ids.append(tid)
+            continue
         url = row.get("url", "") or row.get("source_url", "")
-        if tid and url and url.startswith("http"):
-            url_map[tid] = url
+        if url and url.startswith("http"):
+            html_url_map[tid] = url
 
-    if not url_map:
+    if not ctgov_ids and not html_url_map:
         return {}
 
-    print(f"  Pre-fetching {len(url_map)} registry page(s) for page content ...",
-          file=sys.stderr)
+    print(f"  Pre-fetching content for {len(ctgov_ids)} CT.gov (API) + "
+          f"{len(html_url_map)} other (HTML) trial(s) ...", file=sys.stderr)
 
     results: Dict[str, str] = {}
     semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY)
 
-    async def fetch_one(tid: str, url: str):
+    async def fetch_ctgov(tid: str, session: aiohttp.ClientSession):
+        async with semaphore:
+            text = await _fetch_ctgov_api_text(tid, session)
+            results[tid] = text
+
+    async def fetch_html(tid: str, url: str, session: aiohttp.ClientSession):
         async with semaphore:
             try:
-                timeout = aiohttp.ClientTimeout(total=PREFETCH_TIMEOUT)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    # Some registries redirect HTTP -> HTTPS or to a
-                    # results-specific URL — follow redirects.
-                    async with session.get(url, allow_redirects=True,
-                                           headers={"User-Agent": "Mozilla/5.0"}) as resp:
-                        if resp.status == 200:
-                            html = await resp.text(errors="replace")
-                            text = _extract_page_text(html)
-                            if text and len(text) > 100:
-                                results[tid] = text
-                            else:
-                                # Page was mostly empty / JS-rendered
-                                results[tid] = ""
-                        else:
-                            print(f"    [prefetch] {tid}: HTTP {resp.status}",
-                                  file=sys.stderr)
+                async with session.get(url, allow_redirects=True,
+                                       headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                    if resp.status == 200:
+                        html = await resp.text(errors="replace")
+                        results[tid] = _extract_page_text(html)
+                    else:
+                        print(f"    [prefetch] {tid}: HTTP {resp.status}",
+                              file=sys.stderr)
+                        results[tid] = ""
             except asyncio.TimeoutError:
                 print(f"    [prefetch] {tid}: timeout after {PREFETCH_TIMEOUT}s",
                       file=sys.stderr)
+                results[tid] = ""
             except Exception as exc:
                 print(f"    [prefetch] {tid}: {type(exc).__name__}: {exc}",
                       file=sys.stderr)
+                results[tid] = ""
 
-    await asyncio.gather(*[fetch_one(tid, url) for tid, url in url_map.items()])
+    timeout = aiohttp.ClientTimeout(total=PREFETCH_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        await asyncio.gather(
+            *[fetch_ctgov(tid, session) for tid in ctgov_ids],
+            *[fetch_html(tid, url, session) for tid, url in html_url_map.items()],
+        )
 
     fetched_count = sum(1 for v in results.values() if v)
-    print(f"  Pre-fetched {fetched_count}/{len(url_map)} page(s) with usable content",
+    total = len(ctgov_ids) + len(html_url_map)
+    print(f"  Pre-fetched {fetched_count}/{total} trial(s) with usable content "
+          f"({len(ctgov_ids)} via CT.gov API, {len(html_url_map)} via HTML fetch)",
           file=sys.stderr)
     return results
 
@@ -739,6 +888,19 @@ async def _run_batches(drug: str, batches: List[tuple], extra_suffix: str = "",
             trials = data.get("trials", [])
             print(f"  [{label}] Batch {idx + 1}/{len(batches)} [{source}] - done "
                   f"({len(trials)} trials)", file=sys.stderr)
+            # Flag when the response has fewer trials than we sent — this is
+            # the signature of Gemini's JSON output getting truncated
+            # (max-output-tokens) mid-batch, which otherwise looks identical
+            # to "Gemini searched and found nothing" once merged.
+            sent_ids = {stub.get("NCT_ID", "") for stub in batch if stub.get("NCT_ID")}
+            returned_ids = {_clean_trial_id(t.get("Trial ID", "")) for t in trials if isinstance(t, dict)}
+            if len(trials) < len(batch):
+                dropped = sent_ids - returned_ids
+                if dropped:
+                    print(f"  [{label}] Batch {idx + 1}/{len(batches)} [{source}] - "
+                          f"WARNING: sent {len(batch)} trial(s) but only got {len(trials)} back; "
+                          f"likely dropped by output truncation: {', '.join(sorted(dropped))}",
+                          file=sys.stderr)
             return trials
 
     results = await asyncio.gather(*[
@@ -747,17 +909,42 @@ async def _run_batches(drug: str, batches: List[tuple], extra_suffix: str = "",
     return [t for batch in results for t in batch if isinstance(t, dict)]
 
 
+def _normalise_trial_id(trial_id: str) -> str:
+    """Loose form of a trial ID for fallback matching: strip everything but
+    letters/digits and uppercase. Used only as a fallback when the exact
+    string Gemini returned doesn't match — e.g. it added a trailing space,
+    changed case, or left in a stray character — so a real match isn't
+    silently discarded over formatting noise."""
+    return re.sub(r"[^A-Za-z0-9]", "", str(trial_id or "")).upper()
+
+
 def _merge_enriched(enriched_trials: List[Dict[str, Any]],
                      rows_by_id: Dict[str, Dict[str, Any]]) -> set:
     """Merge Gemini's enriched fields back onto the original registry rows,
     matched by trial ID. Only overwrite when Gemini actually returned
     something usable — never blank out data the registry scraper already
-    had. Returns the set of trial IDs that got a match."""
+    had. Returns the set of trial IDs that got a match.
+
+    Matching tries an exact ID match first, then falls back to a normalised
+    (letters/digits only, uppercased) comparison so minor formatting
+    differences in what Gemini echoes back don't cause a real match to be
+    silently dropped.
+    """
+    norm_lookup = {_normalise_trial_id(tid): tid for tid in rows_by_id}
     matched_ids = set()
+    unmatched_returned = []
     for trial in enriched_trials:
-        trial_id = _clean_trial_id(trial.get("Trial ID", ""))
+        raw_returned_id = trial.get("Trial ID", "")
+        trial_id = _clean_trial_id(raw_returned_id)
         row = rows_by_id.get(trial_id)
         if row is None:
+            fallback_id = norm_lookup.get(_normalise_trial_id(trial_id))
+            if fallback_id:
+                trial_id = fallback_id
+                row = rows_by_id.get(trial_id)
+        if row is None:
+            if raw_returned_id:
+                unmatched_returned.append(raw_returned_id)
             continue
         for gemini_field, row_field in GEMINI_FIELD_MAP.items():
             value = trial.get(gemini_field)
@@ -769,6 +956,12 @@ def _merge_enriched(enriched_trials: List[Dict[str, Any]],
             if value_str and value_str not in ("N/A", "n/a", "None"):
                 row[row_field] = value
         matched_ids.add(trial_id)
+    if unmatched_returned:
+        sample = ", ".join(unmatched_returned[:5])
+        more = f" (+{len(unmatched_returned) - 5} more)" if len(unmatched_returned) > 5 else ""
+        print(f"  [warn] Gemini returned {len(unmatched_returned)} trial(s) whose "
+              f"'Trial ID' matched none of the requested IDs (even after "
+              f"normalisation) — discarded: {sample}{more}", file=sys.stderr)
     return matched_ids
 
 
@@ -915,21 +1108,29 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # Covers both "matched but every efficacy field was N/A" and "no match
     # at all" — either way, give it one more focused shot before giving up.
     if retry_missing:
-        retry_rows = [r for r in rows_by_id.values() if _efficacy_missing(r)]
+        # Retry any row missing efficacy data OR a core field that should
+        # normally be recoverable (title, phase, size, location, status,
+        # start date) — not just efficacy, since those aren't the only
+        # required fields that can come back empty.
+        retry_rows = [r for r in rows_by_id.values() if _needs_retry(r)]
         if retry_rows:
-            print(f"  Pass 2: retrying {len(retry_rows)} trial(s) with no efficacy data, "
+            efficacy_only = sum(1 for r in retry_rows if _efficacy_missing(r) and not _core_fields_missing(r))
+            core_missing = sum(1 for r in retry_rows if _core_fields_missing(r))
+            print(f"  Pass 2: retrying {len(retry_rows)} trial(s) "
+                  f"({efficacy_only} missing only efficacy data, "
+                  f"{core_missing} missing core fields), "
                   f"1 trial/call, deep-dive prompt ...", file=sys.stderr)
             retry_batches = _chunk_by_source(retry_rows, RETRY_BATCH_SIZE,
                                               prefetched=prefetched)
             retry_enriched = await _run_batches(drug, retry_batches,
                                                  extra_suffix=DEEP_DIVE_SUFFIX, label="pass2")
             retry_matched = _merge_enriched(retry_enriched, rows_by_id)
-            still_missing = sum(1 for r in retry_rows if _efficacy_missing(r))
-            print(f"  Pass 2: recovered efficacy data for "
-                  f"{len(retry_rows) - still_missing}/{len(retry_rows)} previously-empty trial(s)",
+            still_missing = sum(1 for r in retry_rows if _needs_retry(r))
+            print(f"  Pass 2: recovered data for "
+                  f"{len(retry_rows) - still_missing}/{len(retry_rows)} previously-incomplete trial(s)",
                   file=sys.stderr)
         else:
-            print("  Pass 2: skipped — no trials missing efficacy data.", file=sys.stderr)
+            print("  Pass 2: skipped — no trials missing efficacy or core data.", file=sys.stderr)
 
     # --- Pass 3 (no API calls): cross-URL efficacy propagation ---
     # Many EU CTIS/EudraCT entries share the same source_url as a CT.gov
@@ -948,9 +1149,18 @@ async def enrich(drug: str, max_records: Optional[int] = None,
         dates_map = await fetch_ctgov_dates(list(ctgov_ids))
         for nct_id, dates in dates_map.items():
             row = rows_by_id.get(nct_id)
-            if row:
-                row["trial_start_date"] = dates["Start Date"]
-                row["trial_completion_date"] = dates["Completion Date"]
+            if not row:
+                continue
+            # Only overwrite when the API actually returned something —
+            # don't blank out a good existing value (from the registry
+            # scraper or Gemini) just because this particular field came
+            # back empty/"N/A" from the API.
+            start = dates.get("Start Date", "")
+            completion = dates.get("Completion Date", "")
+            if start and str(start).strip().upper() not in ("N/A", ""):
+                row["trial_start_date"] = start
+            if completion and str(completion).strip().upper() not in ("N/A", ""):
+                row["trial_completion_date"] = completion
 
     return list(rows_by_id.values())
 
@@ -982,9 +1192,14 @@ def main() -> int:
         return 1
 
     still_empty = sum(1 for r in rows if _efficacy_missing(r))
+    still_core_missing = sum(1 for r in rows if _core_fields_missing(r))
     print(f"  Final: {len(rows) - still_empty}/{len(rows)} trial(s) have at least "
           f"some efficacy data; {still_empty} have none (likely no results published yet).",
           file=sys.stderr)
+    if still_core_missing:
+        print(f"  Final: {still_core_missing}/{len(rows)} trial(s) are still missing "
+              f"a core field (title/phase/size/location/status/start date) after "
+              f"both passes — check these rows.", file=sys.stderr)
 
     final_rows = [remap_row(row, args.drug) for row in rows]
 
