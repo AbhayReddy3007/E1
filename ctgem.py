@@ -2,30 +2,37 @@
 """
 enrich_ctgov_with_gemini.py
 ============================
-Bridges ctgov_trials.py (fast, authoritative structural data straight from
-the ClinicalTrials.gov API v2) with gemini_extractor.py's Step 2 detail
-extraction (Gemini + Google Search — used for efficacy fields that aren't
-in the raw API response: HbA1c change, weight loss %, ALT reduction, MASH
-resolution, dosage, company, etc.).
+Bridges the fast, authoritative registry scrapers — ctgov_trials.py
+(ClinicalTrials.gov API v2) and euct_trials.py (EU CTIS + EudraCT,
+via ctis_drug_trials.py / eudract_drug_trials.py) — with
+gemini_extractor.py's Step 2 detail extraction (Gemini + Google Search —
+used for efficacy fields that aren't in the raw registry data: HbA1c
+change, weight loss %, ALT reduction, MASH resolution, dosage, company,
+etc.).
 
 Instead of letting gemini_extractor.py run its own Step 1 registry search,
-this script hands Gemini the exact NCT IDs already pulled from
-ctgov_trials.py, jumps straight to Step 2 (get_trial_details), and merges
-the enriched fields back onto the original rows — so nothing is duplicated
-or re-discovered, only filled in.
+this script hands Gemini the exact trial IDs already pulled from the
+registry scrapers, jumps straight to Step 2 (get_trial_details), and
+merges the enriched fields back onto the original rows — so nothing is
+duplicated or re-discovered, only filled in.
 
 Usage:
     python enrich_ctgov_with_gemini.py "semaglutide"
     python enrich_ctgov_with_gemini.py "semaglutide" --outdir results --max-records 50
+    python enrich_ctgov_with_gemini.py "semaglutide" --sources ctgov          # US only
+    python enrich_ctgov_with_gemini.py "semaglutide" --sources euct          # EU only
+    python enrich_ctgov_with_gemini.py "semaglutide" --sources ctgov,euct    # both (default)
 
 Requires (same as gemini_extractor.py):
     pip install google-genai aiohttp python-dotenv json-repair
     GOOGLE_API_KEY set in the environment or a .env file
 
-Also requires ctgov_trials.py and gemini_extractor.py to be importable
-(same directory or on PYTHONPATH). If registry_common.py (used by
-ctgov_trials.py) is not available, this script falls back to pandas for
-writing the output Excel file.
+Also requires ctgov_trials.py, euct_trials.py (and, for EU coverage,
+ctis_drug_trials.py / eudract_drug_trials.py on PYTHONPATH) and
+gemini_extractor.py to be importable. If a given source module can't be
+imported, this script just skips that source with a warning rather than
+failing outright. If registry_common.py is not available, this script
+falls back to pandas for writing the output Excel file.
 """
 
 from __future__ import annotations
@@ -37,7 +44,6 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
-import ctgov_trials
 from gemini_extractor import (
     BATCH_SIZE,
     MAX_WORKERS,
@@ -50,6 +56,35 @@ try:
     from registry_common import write_excel
 except ImportError:
     write_excel = None
+
+# Registry source modules. Each exposes fetch(drug, max_records=..., details=...)
+# -> List[Dict] of rows sharing the same unified schema (trial_id, title,
+# public_title, status, phase, sponsor, countries, url, ...) via registry_common.
+# A source that fails to import is skipped (with a warning) rather than
+# crashing the whole run, so this script still works if e.g. ctis/eudract
+# scrapers aren't present on disk.
+SOURCE_MODULES: Dict[str, Any] = {}
+
+try:
+    import ctgov_trials
+    SOURCE_MODULES["ctgov"] = ctgov_trials
+except ImportError as exc:
+    print(f"  [warn] ctgov_trials.py not importable, skipping CT.gov: {exc}",
+          file=sys.stderr)
+
+try:
+    import euct_trials
+    SOURCE_MODULES["euct"] = euct_trials
+except ImportError as exc:
+    print(f"  [warn] euct_trials.py not importable, skipping EU (CTIS/EudraCT): {exc}",
+          file=sys.stderr)
+
+# Trial-ID prefixes that identify a row as CT.gov-native. Only these are
+# safe to pass to fetch_ctgov_dates(), which calls the ClinicalTrials.gov
+# API and won't recognise EU CTIS numbers (CT number, e.g. "2023-501234-56-00")
+# or legacy EudraCT numbers (e.g. "2014-001234-56").
+def _is_ctgov_id(trial_id: str) -> bool:
+    return bool(re.match(r"^NCT\d+$", str(trial_id or ""), flags=re.IGNORECASE))
 
 
 # Maps gemini_extractor's Step-2 output field names -> the column names on
@@ -82,6 +117,8 @@ GEMINI_FIELD_MAP = {
 # The only columns that should appear in the final output, in this order.
 FINAL_COLUMNS = [
     "molecule_name",
+    "registry_source",
+    "trial_id",
     "dosage",
     "phase",
     "trial_title",
@@ -124,13 +161,16 @@ def normalise_phase(raw: str) -> str:
 
 
 def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
-    """Collapse a merged ctgov+Gemini row down to exactly FINAL_COLUMNS.
+    """Collapse a merged registry+Gemini row down to exactly FINAL_COLUMNS.
 
-    Falls back to the raw ctgov_trials.py field name (e.g. 'title',
-    'countries', 'status') if the Gemini-named field wasn't filled in.
+    Falls back to the raw registry field name (e.g. 'title', 'countries',
+    'status' — shared by ctgov_trials.py and euct_trials.py via
+    registry_common) if the Gemini-named field wasn't filled in.
     """
     return {
         "molecule_name": drug,
+        "registry_source": row.get("source", "") or row.get("registry_source", ""),
+        "trial_id": row.get("trial_id", ""),
         "dosage": row.get("dosage", ""),
         "phase": normalise_phase(row.get("phase", "")),
         "trial_title": row.get("trial_title", "") or row.get("title", "")
@@ -157,28 +197,68 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
 
 
 def _to_gemini_trial_stub(row: Dict[str, Any]) -> Dict[str, str]:
-    """gemini_extractor.get_trial_details() only needs NCT_ID + Program_Name
-    per trial to build its prompt — it looks up everything else itself."""
+    """gemini_extractor.get_trial_details() only needs an ID + Program_Name
+    per trial to build its prompt — it looks up everything else itself.
+    The field is still called "NCT_ID" because that's the key
+    get_trial_details expects, but it works fine as a generic trial
+    identifier — CT.gov NCT numbers, EU CTIS CT numbers, or legacy
+    EudraCT numbers all get passed through and searched for as-is."""
     return {
         "NCT_ID": row.get("trial_id", ""),
         "Program_Name": row.get("public_title", "") or row.get("title", "") or "N/A",
     }
 
 
-def _clean_nct_id(raw_id: str) -> str:
+def _clean_trial_id(raw_id: str) -> str:
     """Gemini sometimes returns 'NCT01234567 (STEP 1)' style values."""
     return raw_id.split("(")[0].strip().split(" ")[0].strip()
 
 
-async def enrich(drug: str, max_records: Optional[int] = None) -> List[Dict[str, Any]]:
-    print(f"Fetching trials for '{drug}' from ClinicalTrials.gov API ...", file=sys.stderr)
-    rows = ctgov_trials.fetch(drug, max_records=max_records, details=True)
-    print(f"  Got {len(rows)} trial(s) from ctgov_trials.py", file=sys.stderr)
+async def _fetch_source(name: str, module: Any, drug: str,
+                         max_records: Optional[int]) -> List[Dict[str, Any]]:
+    """Run one registry module's fetch() in a thread (they're synchronous /
+    blocking HTTP scrapers) so multiple sources can be fetched concurrently."""
+    label = {"ctgov": "ClinicalTrials.gov API", "euct": "EU (CTIS + EudraCT)"}.get(name, name)
+    print(f"Fetching trials for '{drug}' from {label} ...", file=sys.stderr)
+    try:
+        rows = await asyncio.to_thread(module.fetch, drug, max_records=max_records,
+                                        details=True)
+    except Exception as exc:
+        print(f"  [warn] {name} fetch failed: {exc}", file=sys.stderr)
+        return []
+    print(f"  Got {len(rows)} trial(s) from {name}", file=sys.stderr)
+    for row in rows:
+        row.setdefault("registry_source", name)
+    return rows
+
+
+async def enrich(drug: str, max_records: Optional[int] = None,
+                  sources: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    sources = sources or list(SOURCE_MODULES.keys())
+    active = [s for s in sources if s in SOURCE_MODULES]
+    missing = [s for s in sources if s not in SOURCE_MODULES]
+    if missing:
+        print(f"  [warn] requested source(s) not available, skipping: {missing}",
+              file=sys.stderr)
+    if not active:
+        print("  No registry sources available to fetch from.", file=sys.stderr)
+        return []
+
+    fetched = await asyncio.gather(*[
+        _fetch_source(name, SOURCE_MODULES[name], drug, max_records)
+        for name in active
+    ])
+    rows = [row for batch in fetched for row in batch]
+    print(f"  Got {len(rows)} trial(s) total across source(s): {active}", file=sys.stderr)
 
     if not rows:
         return []
 
+    # trial_id namespaces don't overlap across sources (NCT######## vs.
+    # CTIS CT numbers vs. EudraCT numbers), so a single dict keyed by
+    # trial_id is safe to merge across sources.
     rows_by_id = {r["trial_id"]: r for r in rows if r.get("trial_id")}
+    ctgov_ids = {tid for tid in rows_by_id if _is_ctgov_id(tid)}
     trial_stubs = [_to_gemini_trial_stub(r) for r in rows_by_id.values()]
 
     # Same batching strategy as gemini_extractor.py's Step 2, just skipping
@@ -208,13 +288,13 @@ async def enrich(drug: str, max_records: Optional[int] = None) -> List[Dict[str,
     results = await asyncio.gather(*[run_batch(i, b) for i, b in enumerate(batches)])
     enriched_trials = [t for batch in results for t in batch if isinstance(t, dict)]
 
-    # Merge Gemini's enriched fields back onto the original ctgov rows,
-    # matched by NCT ID. Only overwrite when Gemini actually returned
-    # something usable — never blank out data ctgov_trials.py already had.
+    # Merge Gemini's enriched fields back onto the original registry rows,
+    # matched by trial ID. Only overwrite when Gemini actually returned
+    # something usable — never blank out data the registry scraper already had.
     merged_count = 0
     for trial in enriched_trials:
-        nct_id = _clean_nct_id(trial.get("Trial ID", ""))
-        row = rows_by_id.get(nct_id)
+        trial_id = _clean_trial_id(trial.get("Trial ID", ""))
+        row = rows_by_id.get(trial_id)
         if row is None:
             continue
         for gemini_field, row_field in GEMINI_FIELD_MAP.items():
@@ -227,14 +307,18 @@ async def enrich(drug: str, max_records: Optional[int] = None) -> List[Dict[str,
           file=sys.stderr)
 
     # Cross-check Start/Completion Date against the authoritative CT.gov API
-    # (usually a no-op here since ctgov_trials.py already used that API, but
-    # kept for parity in case Gemini overwrote them with guesses).
-    dates_map = await fetch_ctgov_dates(list(rows_by_id.keys()))
-    for nct_id, dates in dates_map.items():
-        row = rows_by_id.get(nct_id)
-        if row:
-            row["trial_start_date"] = dates["Start Date"]
-            row["trial_completion_date"] = dates["Completion Date"]
+    # (usually a no-op since ctgov_trials.py already used that API, but kept
+    # for parity in case Gemini overwrote them with guesses). This ONLY
+    # applies to CT.gov-native rows (NCT IDs) — the CT.gov API has no
+    # knowledge of EU CTIS/EudraCT trial numbers, so EU rows keep whatever
+    # dates their own registry scraper / Gemini already filled in.
+    if ctgov_ids:
+        dates_map = await fetch_ctgov_dates(list(ctgov_ids))
+        for nct_id, dates in dates_map.items():
+            row = rows_by_id.get(nct_id)
+            if row:
+                row["trial_start_date"] = dates["Start Date"]
+                row["trial_completion_date"] = dates["Completion Date"]
 
     return list(rows_by_id.values())
 
@@ -245,10 +329,16 @@ def main() -> int:
     ap.add_argument("drug", help="drug / intervention name, e.g. 'semaglutide'")
     ap.add_argument("--outdir", default=".", help="output directory")
     ap.add_argument("--max-records", type=int, default=None,
-                     help="cap the number of ctgov trials fetched/enriched")
+                     help="cap the number of trials fetched/enriched PER SOURCE")
+    ap.add_argument("--sources", default="ctgov,euct",
+                     help="comma-separated registry sources to pull from: "
+                          "'ctgov' (ClinicalTrials.gov), 'euct' (EU CTIS + EudraCT), "
+                          f"or both (default). Available on this machine: "
+                          f"{', '.join(SOURCE_MODULES) or 'none'}")
     args = ap.parse_args()
 
-    rows = asyncio.run(enrich(args.drug, args.max_records))
+    sources = [s.strip() for s in args.sources.split(",") if s.strip()]
+    rows = asyncio.run(enrich(args.drug, args.max_records, sources))
 
     if not rows:
         print("No trials found / enriched.", file=sys.stderr)
@@ -258,11 +348,12 @@ def main() -> int:
 
     os.makedirs(args.outdir, exist_ok=True)
     drug_slug = args.drug.lower().replace(" ", "_")
-    out_path = os.path.join(args.outdir, f"{drug_slug}_ctgov_gemini_enriched.xlsx")
+    src_tag = "_".join(sources)
+    out_path = os.path.join(args.outdir, f"{drug_slug}_{src_tag}_gemini_enriched.xlsx")
 
     if write_excel is not None:
         write_excel(final_rows, out_path, FINAL_COLUMNS,
-                    sheet_name="ClinicalTrials.gov + Gemini")
+                    sheet_name="Registries + Gemini")
     else:
         import pandas as pd
         pd.DataFrame(final_rows, columns=FINAL_COLUMNS).to_excel(out_path, index=False)
