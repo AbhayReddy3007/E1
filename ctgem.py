@@ -44,6 +44,8 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
+import aiohttp
+
 from gemini_extractor import (
     MAX_WORKERS,
     RATE_LIMIT_DELAY,
@@ -79,6 +81,149 @@ EFFICACY_ROW_FIELDS = [
 
 def _efficacy_missing(row: Dict[str, Any]) -> bool:
     return not any(str(row.get(f, "")).strip() for f in EFFICACY_ROW_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# Pre-fetch: hit each trial's registry URL before sending to Gemini so we
+# can feed the raw page text (especially the results section) directly into
+# the prompt. This saves Gemini a search call per trial and gives it data
+# that Google Search sometimes can't reach (dynamic JS-rendered results
+# tabs, pages behind cookie walls, etc.).
+# ---------------------------------------------------------------------------
+
+# How many registry pages to fetch concurrently.
+PREFETCH_CONCURRENCY = 10
+
+# Max characters of page text to include per trial — enough for the results
+# section without blowing up the prompt context window.
+PREFETCH_MAX_CHARS = 6000
+
+# Timeout per page fetch (seconds). Registry pages are usually fast; if
+# one hangs we don't want to block the whole pipeline.
+PREFETCH_TIMEOUT = 20
+
+# Sections / keywords we try to isolate from the fetched HTML. If we find
+# a results section we prefer that over the full page — it's denser and
+# more relevant.
+_RESULTS_SECTION_PATTERNS = [
+    # CT.gov results tab content
+    re.compile(r"(?si)(Study\s+Results.*?)(?=<footer|<div[^>]*id=[\"']footer|$)"),
+    # CT.gov outcome measures
+    re.compile(r"(?si)(Primary\s+Outcome\s+Measures?.*?)(?=Secondary\s+Outcome|<footer|$)"),
+    re.compile(r"(?si)(Secondary\s+Outcome\s+Measures?.*?)(?=<footer|$)"),
+    # EU CTIS results
+    re.compile(r"(?si)(Results\s+information.*?)(?=<footer|$)"),
+    # Generic "results" heading
+    re.compile(r"(?si)(<h[1-4][^>]*>.*?results.*?</h[1-4]>.*?)(?=<footer|$)"),
+]
+
+
+def _extract_page_text(html: str, max_chars: int = PREFETCH_MAX_CHARS) -> str:
+    """Extract useful text from registry page HTML.
+
+    Tries to isolate the results section first; falls back to the full
+    page body. Strips HTML tags and collapses whitespace.
+    """
+    if not html:
+        return ""
+
+    # Try to find a results-specific section first
+    results_text = ""
+    for pattern in _RESULTS_SECTION_PATTERNS:
+        m = pattern.search(html)
+        if m:
+            results_text = m.group(1)
+            break
+
+    # Use results section if found, otherwise fall back to <body> or full HTML
+    if results_text:
+        text_source = results_text
+    else:
+        # Extract body content
+        body_match = re.search(r"(?si)<body[^>]*>(.*?)</body>", html)
+        text_source = body_match.group(1) if body_match else html
+
+    # Strip script/style blocks
+    text_source = re.sub(r"(?si)<(script|style|noscript)[^>]*>.*?</\1>", " ", text_source)
+    # Strip HTML tags
+    text_source = re.sub(r"<[^>]+>", " ", text_source)
+    # Decode common HTML entities
+    text_source = (text_source
+                   .replace("&amp;", "&").replace("&lt;", "<")
+                   .replace("&gt;", ">").replace("&nbsp;", " ")
+                   .replace("&#8209;", "-").replace("&#39;", "'")
+                   .replace("&quot;", '"'))
+    # Collapse whitespace
+    text_source = re.sub(r"\s+", " ", text_source).strip()
+
+    if len(text_source) > max_chars:
+        # Keep the beginning (trial metadata) and the end (often has
+        # results/outcome data) with a marker in the middle.
+        half = max_chars // 2
+        text_source = (text_source[:half]
+                       + " [...PAGE TRUNCATED...] "
+                       + text_source[-half:])
+
+    return text_source
+
+
+async def _prefetch_registry_pages(
+    rows: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Fetch registry page content for each trial that has a URL.
+
+    Returns a dict mapping trial_id -> extracted page text.
+    Only fetches pages that have a plausible registry URL (http/https).
+    """
+    url_map: Dict[str, str] = {}  # trial_id -> url
+    for row in rows:
+        tid = row.get("trial_id", "")
+        url = row.get("url", "") or row.get("source_url", "")
+        if tid and url and url.startswith("http"):
+            url_map[tid] = url
+
+    if not url_map:
+        return {}
+
+    print(f"  Pre-fetching {len(url_map)} registry page(s) for page content ...",
+          file=sys.stderr)
+
+    results: Dict[str, str] = {}
+    semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY)
+
+    async def fetch_one(tid: str, url: str):
+        async with semaphore:
+            try:
+                timeout = aiohttp.ClientTimeout(total=PREFETCH_TIMEOUT)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    # Some registries redirect HTTP -> HTTPS or to a
+                    # results-specific URL — follow redirects.
+                    async with session.get(url, allow_redirects=True,
+                                           headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                        if resp.status == 200:
+                            html = await resp.text(errors="replace")
+                            text = _extract_page_text(html)
+                            if text and len(text) > 100:
+                                results[tid] = text
+                            else:
+                                # Page was mostly empty / JS-rendered
+                                results[tid] = ""
+                        else:
+                            print(f"    [prefetch] {tid}: HTTP {resp.status}",
+                                  file=sys.stderr)
+            except asyncio.TimeoutError:
+                print(f"    [prefetch] {tid}: timeout after {PREFETCH_TIMEOUT}s",
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f"    [prefetch] {tid}: {type(exc).__name__}: {exc}",
+                      file=sys.stderr)
+
+    await asyncio.gather(*[fetch_one(tid, url) for tid, url in url_map.items()])
+
+    fetched_count = sum(1 for v in results.values() if v)
+    print(f"  Pre-fetched {fetched_count}/{len(url_map)} page(s) with usable content",
+          file=sys.stderr)
+    return results
 
 
 try:
@@ -202,11 +347,13 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
         "trial_id": row.get("trial_id", ""),
         "dosage": row.get("dosage", ""),
         "phase": normalise_phase(row.get("phase", "")),
-        "trial_title": row.get("trial_title", "") or row.get("title", "")
-                        or row.get("public_title", ""),
+        "trial_title": (row.get("trial_title", "") or row.get("title", "")
+                        or row.get("public_title", "")
+                        or row.get("brief_title", "")),
         "trial_study_type": row.get("trial_study_type", "") or row.get("study_type", ""),
-        "trial_size": row.get("trial_size", "") or row.get("actual_enrollment", "")
-                      or row.get("target_enrollment", ""),
+        "trial_size": (row.get("trial_size", "") or row.get("actual_enrollment", "")
+                      or row.get("target_enrollment", "")
+                      or row.get("enrollment", "")),
         "trial_location": row.get("trial_location", "") or row.get("countries", ""),
         "trial_start_date": row.get("trial_start_date", "") or row.get("start_date", ""),
         "trial_completion_date": row.get("trial_completion_date", "")
@@ -225,17 +372,106 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
     }
 
 
-def _to_gemini_trial_stub(row: Dict[str, Any]) -> Dict[str, str]:
-    """gemini_extractor.get_trial_details() only needs an ID + Program_Name
-    per trial to build its prompt — it looks up everything else itself.
+def _to_gemini_trial_stub(row: Dict[str, Any],
+                          prefetched: Optional[Dict[str, str]] = None,
+                          ) -> Dict[str, str]:
+    """Build a context-rich stub for Gemini's Step 2 prompt.
+
     The field is still called "NCT_ID" because that's the key
     get_trial_details expects, but it works fine as a generic trial
     identifier — CT.gov NCT numbers, EU CTIS CT numbers, or legacy
-    EudraCT numbers all get passed through and searched for as-is."""
-    return {
-        "NCT_ID": row.get("trial_id", ""),
-        "Program_Name": row.get("public_title", "") or row.get("title", "") or "N/A",
+    EudraCT numbers all get passed through and searched for as-is.
+
+    We now also pack every piece of metadata the registry scraper already
+    fetched into a "Registry_Context" field. This gives Gemini:
+      1. Concrete search anchors (sponsor name, exact title, countries)
+         so it can find publications and press releases faster.
+      2. Known values it can skip re-searching, letting it spend its
+         full search budget on the hard-to-find efficacy fields (HbA1c,
+         weight loss, ALT, MASH, dosage).
+      3. Disambiguation cues for common molecule names that return many
+         unrelated trials in a bare search.
+
+    If prefetched page text is available (from _prefetch_registry_pages),
+    it is included as "Prefetched_Page_Content" so Gemini can extract
+    efficacy data directly without needing to search for the page.
+    """
+    trial_id = row.get("trial_id", "")
+    program_name = (row.get("public_title", "") or row.get("title", "")
+                    or row.get("brief_title", "") or "N/A")
+
+    # Collect every useful field the registry already gave us.
+    context_parts: List[str] = []
+
+    sponsor = row.get("sponsor", "") or row.get("lead_sponsor", "")
+    if sponsor:
+        context_parts.append(f"Sponsor/Company: {sponsor}")
+
+    phase = row.get("phase", "")
+    if phase:
+        context_parts.append(f"Phase: {phase}")
+
+    status = row.get("status", "") or row.get("overall_status", "")
+    if status:
+        context_parts.append(f"Status: {status}")
+
+    enrollment = (row.get("actual_enrollment", "")
+                  or row.get("target_enrollment", "")
+                  or row.get("enrollment", ""))
+    if enrollment:
+        context_parts.append(f"Enrollment: {enrollment}")
+
+    study_type = row.get("study_type", "")
+    if study_type:
+        context_parts.append(f"Study Type: {study_type}")
+
+    countries = row.get("countries", "")
+    if countries:
+        context_parts.append(f"Countries: {countries}")
+
+    start_date = row.get("start_date", "")
+    if start_date:
+        context_parts.append(f"Start Date: {start_date}")
+
+    completion_date = row.get("completion_date", "")
+    if completion_date:
+        context_parts.append(f"Completion Date: {completion_date}")
+
+    conditions = row.get("conditions", "") or row.get("condition", "")
+    if conditions:
+        context_parts.append(f"Conditions: {conditions}")
+
+    interventions = row.get("interventions", "") or row.get("intervention", "")
+    if interventions:
+        context_parts.append(f"Interventions: {interventions}")
+
+    url = row.get("url", "")
+    if url:
+        context_parts.append(f"Registry URL: {url}")
+
+    # Secondary IDs help Gemini cross-reference across registries
+    secondary_ids = row.get("secondary_ids", "") or row.get("other_ids", "")
+    if secondary_ids:
+        context_parts.append(f"Secondary IDs: {secondary_ids}")
+
+    # Has results posted? Tells Gemini whether to look at the results tab
+    has_results = row.get("has_results", "")
+    if has_results:
+        context_parts.append(f"Results Posted: {has_results}")
+
+    stub = {
+        "NCT_ID": trial_id,
+        "Program_Name": program_name,
     }
+
+    if context_parts:
+        stub["Registry_Context"] = "; ".join(context_parts)
+
+    # Inject pre-fetched page text if available
+    if prefetched and trial_id in prefetched and prefetched[trial_id]:
+        stub["Prefetched_Page_Content"] = prefetched[trial_id]
+
+    return stub
 
 
 def _clean_trial_id(raw_id: str) -> str:
@@ -287,8 +523,50 @@ tested product.
 # We don't edit gemini_extractor.py itself (other callers may depend on
 # its exact prompt); instead we use its extra_fields_prompt hook to patch
 # in registry-appropriate guidance per batch, keyed by registry_source.
+_CONTEXT_USAGE_BLOCK = """
+REGISTRY CONTEXT — HOW TO USE IT:
+Each trial below may include a "Registry_Context" field with metadata
+already fetched from the official registry (sponsor, phase, status,
+enrollment, conditions, interventions, countries, dates, registry URL).
+USE this context to:
+1. SKIP re-searching for fields you already have (phase, status, sponsor,
+   enrollment, study type, countries, dates) — trust the registry values
+   and spend your search budget on the EFFICACY fields instead.
+2. BUILD BETTER SEARCHES — use the sponsor/company name + trial title +
+   conditions as search terms to find press releases, conference
+   abstracts, and publications that report HbA1c change, weight loss,
+   ALT reduction, and MASH resolution data.
+3. OPEN THE REGISTRY URL directly if provided — go to the Results tab
+   (not just the summary/protocol page) for posted efficacy data.
+4. CROSS-REFERENCE — if Secondary IDs are provided (e.g. an NCT number
+   for an EU trial), search for those too to find linked publications.
+FOCUS YOUR SEARCH EFFORT on: dosage, HbA1c change (%), weight change (%),
+ALT reduction (%), MASH resolution (%), and company name. These are the
+fields most likely to require digging into results pages, press releases,
+and published papers. The rest are usually already filled in from the
+registry metadata.
+
+PRE-FETCHED PAGE CONTENT:
+Some trials include a "Prefetched_Page_Content" field containing text
+already extracted from the trial's official registry page. When present:
+- EXTRACT efficacy data DIRECTLY from this text FIRST — it contains the
+  actual page content including any posted results, outcome measures,
+  and study details. This is the MOST RELIABLE source.
+- Look for keywords like "primary outcome", "HbA1c", "weight", "ALT",
+  "MASH", "resolution", "reduction", "change from baseline", "placebo",
+  "dose", "mg" in the prefetched text to find efficacy numbers.
+- You do NOT need to search for or visit this page — it has already been
+  fetched for you. Save your search budget for finding publications,
+  press releases, and conference abstracts that may have ADDITIONAL data
+  not on the registry page.
+- If the prefetched text shows "[...PAGE TRUNCATED...]", the full page
+  was too long; you still have the most relevant beginning and end
+  sections — extract what you can and only search if key efficacy fields
+  are still missing.
+"""
+
 EXTRA_PROMPT_BY_SOURCE: Dict[str, str] = {
-    "euct": """
+    "euct": _CONTEXT_USAGE_BLOCK + """
 ADDITIONAL SOURCE GUIDANCE FOR THIS BATCH (EU trials):
 - These trial IDs come from the EU CTIS portal (euclinicaltrials.eu,
   format like "2023-501234-56-00") or the legacy EudraCT / EU-CTR
@@ -302,10 +580,13 @@ ADDITIONAL SOURCE GUIDANCE FOR THIS BATCH (EU trials):
   or "2014-001234-56") — do NOT substitute an NCT number or any other ID,
   even if you find one for the same trial.
 """,
-    "ctgov": """
+    "ctgov": _CONTEXT_USAGE_BLOCK + """
 ADDITIONAL SOURCE GUIDANCE FOR THIS BATCH (CT.gov trials):
 - "Trial ID" in your JSON response MUST be the EXACT NCT identifier given
   to you above for that trial, character-for-character — do not alter it.
+- If "Registry_Context" includes "Results Posted: True" or "Results Posted:
+  Yes", go directly to clinicaltrials.gov/study/<ID> → "Study Results" tab
+  to extract efficacy endpoints — don't stop at the summary page.
 """,
 }
 
@@ -320,14 +601,23 @@ returned no efficacy data for this trial. Before answering:
 1. Open the trial's own results page (e.g. clinicaltrials.gov/study/<ID>
    -> "Study Results" tab; or the EU registry's results page) — not just
    the summary/protocol page.
-2. Search for the trial's Program Name / NCT ID alongside terms like
-   "results", "topline", "primary endpoint", "HbA1c", "weight loss",
-   "efficacy" — company press releases and conference abstracts often
-   report efficacy numbers before the formal registry results page is
-   updated.
+2. USE THE REGISTRY_CONTEXT provided below to build precise searches:
+   - Search for: "<Sponsor Name>" + "<Program Name>" + "results" / "topline"
+   - Search for: "<Sponsor Name>" + "<Conditions>" + "phase <N>" + "efficacy"
+   - Search for: "<Trial ID>" + "HbA1c" / "weight loss" / "ALT" / "MASH"
+   - Search for: "<Sponsor Name>" + "<Program Name>" + "press release"
+   - Search for: "<Sponsor Name>" + "<Program Name>" + site:pubmed.ncbi.nlm.nih.gov
+   Company press releases and conference abstracts (ADA, EASD, AASLD,
+   ENDO) often report efficacy numbers before the formal registry results
+   page is updated.
 3. Check for a linked publication (PubMed, NEJM, Lancet, Diabetes Care,
-   etc.) — trial result papers usually report exact efficacy numbers even
-   when the registry page only shows "N/A".
+   Hepatology, JAMA, etc.) — trial result papers usually report exact
+   efficacy numbers even when the registry page only shows "N/A".
+4. If the trial has secondary IDs listed in Registry_Context, search for
+   those IDs too — some publications cite the secondary ID rather than the
+   primary one.
+5. Try the sponsor's investor relations / pipeline page — many companies
+   post topline data there before peer-reviewed publication.
 Only use "N/A" if you've checked the above and the trial genuinely has no
 completed results yet (e.g. still recruiting, or terminated with no
 posted data) — don't default to "N/A" just because the summary page alone
@@ -409,13 +699,14 @@ def _merge_enriched(enriched_trials: List[Dict[str, Any]],
     return matched_ids
 
 
-def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int) -> List[tuple]:
+def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int,
+                     prefetched: Optional[Dict[str, str]] = None) -> List[tuple]:
     rows_by_source: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         rows_by_source.setdefault(r.get("registry_source", "ctgov"), []).append(r)
     batches: List[tuple] = []
     for source, source_rows in rows_by_source.items():
-        stubs = [_to_gemini_trial_stub(r) for r in source_rows]
+        stubs = [_to_gemini_trial_stub(r, prefetched=prefetched) for r in source_rows]
         for i in range(0, len(stubs), batch_size):
             batches.append((source, stubs[i:i + batch_size]))
     return batches
@@ -455,8 +746,15 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     rows_by_id = {r["trial_id"]: r for r in rows if r.get("trial_id")}
     ctgov_ids = {tid for tid in rows_by_id if _is_ctgov_id(tid)}
 
+    # --- Pre-fetch: hit each trial's registry URL to grab page content ---
+    # This runs concurrently and gives Gemini the actual page text so it
+    # can extract efficacy data directly instead of spending a search call
+    # to re-find a page we already have the URL for.
+    prefetched = await _prefetch_registry_pages(list(rows_by_id.values()))
+
     # --- Pass 1: normal batching, smaller batch size for research depth ---
-    batches = _chunk_by_source(list(rows_by_id.values()), FIRST_PASS_BATCH_SIZE)
+    batches = _chunk_by_source(list(rows_by_id.values()), FIRST_PASS_BATCH_SIZE,
+                                prefetched=prefetched)
     print(f"  Sending {len(rows_by_id)} trial(s) to Gemini in {len(batches)} "
           f"batch(es) of up to {FIRST_PASS_BATCH_SIZE} ...", file=sys.stderr)
     enriched_trials = await _run_batches(drug, batches, label="pass1")
@@ -485,7 +783,8 @@ async def enrich(drug: str, max_records: Optional[int] = None,
         if retry_rows:
             print(f"  Pass 2: retrying {len(retry_rows)} trial(s) with no efficacy data, "
                   f"1 trial/call, deep-dive prompt ...", file=sys.stderr)
-            retry_batches = _chunk_by_source(retry_rows, RETRY_BATCH_SIZE)
+            retry_batches = _chunk_by_source(retry_rows, RETRY_BATCH_SIZE,
+                                              prefetched=prefetched)
             retry_enriched = await _run_batches(drug, retry_batches,
                                                  extra_suffix=DEEP_DIVE_SUFFIX, label="pass2")
             retry_matched = _merge_enriched(retry_enriched, rows_by_id)
