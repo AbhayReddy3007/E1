@@ -388,6 +388,137 @@ async def _prefetch_registry_pages(
     return results
 
 
+# ---------------------------------------------------------------------------
+# PubMed pre-fetch: search NCBI's free, keyless E-utilities API directly for
+# a published paper on each trial, and hand Gemini the abstract text as
+# pre-fetched context — the same way _prefetch_registry_pages hands it
+# CT.gov API text.
+#
+# WHY THIS EXISTS: manual verification of a prior run found real, indexed
+# results that the pipeline still returned blank for — most notably
+# NCT05813925 (REDEFINE 5), which has a full published paper (Yamauchi et
+# al., Lancet Diabetes & Endocrinology, June 2026) findable in under a
+# second via PubMed's own search API. The batch prompt already instructs
+# Gemini to search "<Acronym> site:pubmed.ncbi.nlm.nih.gov" itself, but
+# that depends on Gemini's own search grounding actually surfacing it
+# within its search budget for that trial. Querying PubMed directly in
+# Python removes that dependency entirely for the journal-publication
+# channel: instead of asking Gemini to go find the paper, we find it
+# ourselves and paste the abstract straight into its prompt, the same
+# "verify against a primary source" approach used to confirm this gap by
+# hand. Press releases (globenewswire/prnewswire/biospace/etc.) still rely
+# on Gemini's own search — there's no equivalent free, keyless, structured
+# API for wire-service press releases the way there is for PubMed.
+# ---------------------------------------------------------------------------
+
+PUBMED_CONCURRENCY = 3          # NCBI's unauthenticated rate limit is ~3 req/s
+PUBMED_TIMEOUT = 15
+PUBMED_MAX_IDS = 3              # top N matching papers to pull abstracts for
+PUBMED_MAX_CHARS = 4000         # keep prompt size reasonable per trial
+
+_EUTILS_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+_EUTILS_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+
+async def _pubmed_search(session: aiohttp.ClientSession, term: str) -> List[str]:
+    """Run one PubMed esearch query, return matching PMIDs (best-effort,
+    never raises — a failed/empty search just means no prefetch for that
+    query, Gemini's own search is still tried as normal)."""
+    params = {"db": "pubmed", "term": term, "retmode": "json", "retmax": str(PUBMED_MAX_IDS)}
+    try:
+        async with session.get(_EUTILS_ESEARCH, params=params,
+                                timeout=aiohttp.ClientTimeout(total=PUBMED_TIMEOUT)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            return data.get("esearchresult", {}).get("idlist", []) or []
+    except Exception as exc:
+        print(f"    [pubmed] search failed for {term!r}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return []
+
+
+async def _pubmed_fetch_abstracts(session: aiohttp.ClientSession, pmids: List[str]) -> str:
+    """Fetch plain-text abstracts for a list of PMIDs in one call."""
+    if not pmids:
+        return ""
+    params = {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "text"}
+    try:
+        async with session.get(_EUTILS_EFETCH, params=params,
+                                timeout=aiohttp.ClientTimeout(total=PUBMED_TIMEOUT)) as resp:
+            if resp.status != 200:
+                return ""
+            text = await resp.text()
+            return text.strip()[:PUBMED_MAX_CHARS]
+    except Exception as exc:
+        print(f"    [pubmed] fetch failed for {pmids}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return ""
+
+
+async def _prefetch_pubmed_one(row: Dict[str, Any], session: aiohttp.ClientSession,
+                                semaphore: asyncio.Semaphore) -> tuple:
+    """Search PubMed for one trial via its acronym first (far more likely to
+    hit — trial papers are almost always titled/indexed by program name,
+    e.g. "REDEFINE 5", not by NCT number), falling back to the raw trial ID.
+    Returns (trial_id, abstract_text_or_empty)."""
+    trial_id = row.get("trial_id", "")
+    title = (row.get("public_title", "") or row.get("title", "")
+             or row.get("brief_title", "") or "")
+    acronym = _extract_trial_acronym(title)
+
+    queries = []
+    if acronym:
+        # Quote the acronym and anchor to title/abstract so e.g. "STEP 1"
+        # doesn't match unrelated papers that merely mention "step 1" of a
+        # procedure.
+        queries.append(f'"{acronym}"[Title/Abstract]')
+    if trial_id:
+        queries.append(f'"{trial_id}"')
+    if not queries:
+        return trial_id, ""
+
+    async with semaphore:
+        pmids: List[str] = []
+        for q in queries:
+            pmids = await _pubmed_search(session, q)
+            if pmids:
+                break
+        if not pmids:
+            return trial_id, ""
+        text = await _pubmed_fetch_abstracts(session, pmids)
+        return trial_id, text
+
+
+async def _prefetch_pubmed(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """For every trial with a recognisable acronym (or, failing that, its
+    raw trial ID), query PubMed directly and return {trial_id: abstract
+    text}. Best-effort and non-fatal: any trial with no acronym, no PubMed
+    hit, or a failed request just gets no entry, same as before this
+    prefetch existed."""
+    candidates = [r for r in rows if r.get("trial_id")]
+    if not candidates:
+        return {}
+
+    print(f"  Pre-fetching PubMed abstracts for {len(candidates)} trial(s) "
+          f"(direct NCBI E-utilities lookup) ...", file=sys.stderr)
+
+    results: Dict[str, str] = {}
+    semaphore = asyncio.Semaphore(PUBMED_CONCURRENCY)
+    timeout = aiohttp.ClientTimeout(total=PUBMED_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        pairs = await asyncio.gather(*[
+            _prefetch_pubmed_one(row, session, semaphore) for row in candidates
+        ])
+    for trial_id, text in pairs:
+        if text:
+            results[trial_id] = text
+
+    print(f"  Pre-fetched PubMed abstracts for {len(results)}/{len(candidates)} trial(s)",
+          file=sys.stderr)
+    return results
+
+
 try:
     from registry_common import write_excel
 except ImportError:
@@ -586,6 +717,7 @@ def _detect_acronym_collisions(rows: List[Dict[str, Any]]) -> Dict[str, List[str
 def _to_gemini_trial_stub(row: Dict[str, Any],
                           prefetched: Optional[Dict[str, str]] = None,
                           acronym_collisions: Optional[Dict[str, List[str]]] = None,
+                          pubmed_prefetched: Optional[Dict[str, str]] = None,
                           ) -> Dict[str, str]:
     """Build a context-rich stub for Gemini's Step 2 prompt.
 
@@ -715,6 +847,13 @@ def _to_gemini_trial_stub(row: Dict[str, Any],
     # Inject pre-fetched page text if available
     if prefetched and trial_id in prefetched and prefetched[trial_id]:
         stub["Prefetched_Page_Content"] = prefetched[trial_id]
+
+    # Inject a pre-fetched PubMed abstract if a matching publication was
+    # found via direct NCBI search (see _prefetch_pubmed) — this is often
+    # the single richest source for HbA1c/weight/ALT/MASH numbers, since
+    # trial-result papers report exact figures the registry page doesn't.
+    if pubmed_prefetched and trial_id in pubmed_prefetched and pubmed_prefetched[trial_id]:
+        stub["Prefetched_Publication_Content"] = pubmed_prefetched[trial_id]
 
     return stub
 
@@ -853,6 +992,23 @@ already extracted from the trial's official registry page. When present:
   was too long; you still have the most relevant beginning and end
   sections — extract what you can and only search if key efficacy fields
   are still missing.
+
+PRE-FETCHED PUBLICATION CONTENT (PubMed):
+Some trials include a "Prefetched_Publication_Content" field — the actual
+abstract text of a PubMed-indexed paper matched to this trial by acronym
+or trial ID via a direct NCBI database lookup (not a Gemini search). This
+is a REAL, CONFIRMED publication about this exact trial:
+- Treat it as a PRIMARY, HIGH-CONFIDENCE source — trial-result papers
+  report exact efficacy numbers (HbA1c change, weight change, ALT
+  reduction, MASH/NASH resolution, with their measurement duration) that
+  are often more precise and complete than press releases.
+  extract every efficacy value it reports before doing anything else.
+- If this field is present, do NOT report "N/A" for an efficacy field
+  the abstract clearly states — that would be ignoring evidence you were
+  handed. Read the numbers out of the abstract text directly.
+- The abstract may be truncated; if a number is cut off or the abstract
+  only gives a qualitative result ("significantly reduced"), still search
+  as normal for the precise figure before falling back to N/A.
 """
 
 EXTRA_PROMPT_BY_SOURCE: Dict[str, str] = {
@@ -890,6 +1046,11 @@ ADDITIONAL SOURCE GUIDANCE FOR THIS BATCH (CT.gov trials):
 DEEP_DIVE_SUFFIX = """
 DEEP-DIVE MODE — this is a single-trial retry because the first pass
 returned no efficacy data for this trial. Before answering:
+0. FIRST check whether a "Prefetched_Publication_Content" field is present
+   below. If it is, it's the abstract of a real PubMed-indexed paper about
+   THIS trial, fetched directly from NCBI (not a search result Gemini has
+   to find) — extract every efficacy number it contains before doing
+   anything else. Do not report N/A for a field this abstract answers.
 1. If a "Trial Acronym/Program" is in Registry_Context (e.g. REDEFINE 1,
    REIMAGINE 2), START HERE — search for:
    - "<Acronym> results" (e.g. "REDEFINE 1 results")
@@ -1169,14 +1330,16 @@ def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
 
 def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int,
                      prefetched: Optional[Dict[str, str]] = None,
-                     acronym_collisions: Optional[Dict[str, List[str]]] = None) -> List[tuple]:
+                     acronym_collisions: Optional[Dict[str, List[str]]] = None,
+                     pubmed_prefetched: Optional[Dict[str, str]] = None) -> List[tuple]:
     rows_by_source: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         rows_by_source.setdefault(r.get("registry_source", "ctgov"), []).append(r)
     batches: List[tuple] = []
     for source, source_rows in rows_by_source.items():
         stubs = [_to_gemini_trial_stub(r, prefetched=prefetched,
-                                        acronym_collisions=acronym_collisions)
+                                        acronym_collisions=acronym_collisions,
+                                        pubmed_prefetched=pubmed_prefetched)
                  for r in source_rows]
         for i in range(0, len(stubs), batch_size):
             batches.append((source, stubs[i:i + batch_size]))
@@ -1223,6 +1386,15 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # to re-find a page we already have the URL for.
     prefetched = await _prefetch_registry_pages(list(rows_by_id.values()))
 
+    # Run alongside the registry prefetch: a direct, keyless PubMed lookup
+    # per trial (by acronym, falling back to trial ID). This is what closed
+    # the gap found during manual verification — e.g. NCT05813925/REDEFINE 5
+    # has a full Lancet Diabetes & Endocrinology paper indexed on PubMed
+    # that Gemini's own in-context search kept missing. See _prefetch_pubmed
+    # for why this exists as a separate, deterministic step rather than
+    # relying solely on prompting Gemini to search harder.
+    pubmed_prefetched = await _prefetch_pubmed(list(rows_by_id.values()))
+
     # Detect acronym collisions (e.g. two unrelated trials both informally
     # called "REDEFINE 4" in outside press coverage) so the per-trial prompt
     # can warn Gemini to verify a match before assigning press-release data
@@ -1238,7 +1410,8 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # --- Pass 1: normal batching, smaller batch size for research depth ---
     batches = _chunk_by_source(list(rows_by_id.values()), FIRST_PASS_BATCH_SIZE,
                                 prefetched=prefetched,
-                                acronym_collisions=acronym_collisions)
+                                acronym_collisions=acronym_collisions,
+                                pubmed_prefetched=pubmed_prefetched)
     print(f"  Sending {len(rows_by_id)} trial(s) to Gemini in {len(batches)} "
           f"batch(es) of up to {FIRST_PASS_BATCH_SIZE} ...", file=sys.stderr)
     enriched_trials = await _run_batches(drug, batches, label="pass1")
@@ -1277,7 +1450,8 @@ async def enrich(drug: str, max_records: Optional[int] = None,
                   f"1 trial/call, deep-dive prompt ...", file=sys.stderr)
             retry_batches = _chunk_by_source(retry_rows, RETRY_BATCH_SIZE,
                                               prefetched=prefetched,
-                                              acronym_collisions=acronym_collisions)
+                                              acronym_collisions=acronym_collisions,
+                                              pubmed_prefetched=pubmed_prefetched)
             retry_enriched = await _run_batches(drug, retry_batches,
                                                  extra_suffix=DEEP_DIVE_SUFFIX, label="pass2")
             retry_matched = _merge_enriched(retry_enriched, rows_by_id)
