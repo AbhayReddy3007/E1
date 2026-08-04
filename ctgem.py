@@ -42,6 +42,7 @@ import asyncio
 import os
 import re
 import sys
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -50,8 +51,12 @@ from gemini_extractor import (
     MAX_WORKERS,
     RATE_LIMIT_DELAY,
     get_trial_details,
-    fetch_ctgov_dates,
 )
+# NOTE: gemini_extractor's fetch_ctgov_dates (dates only) is superseded by
+# this file's own _fetch_ctgov_authoritative(), which fetches status and
+# enrollment from the same CT.gov API alongside dates — see that function
+# for why status/enrollment needed the same authoritative-override
+# treatment dates already had.
 
 # Our own batching size for the FIRST pass — deliberately smaller than
 # gemini_extractor's own BATCH_SIZE (8). Packing 8 trials x ~20 fields,
@@ -314,6 +319,91 @@ async def _fetch_ctgov_api_text(nct_id: str, session: aiohttp.ClientSession) -> 
 
     text = "\n".join(p for p in parts if p and not p.endswith(": ") and not p.endswith("— "))
     return text[:PREFETCH_MAX_CHARS]
+
+
+# Maps CT.gov API v2's enum-style OverallStatus values to the Title Case
+# style already used elsewhere in this pipeline's output (e.g. "Completed",
+# "Active, not recruiting"), so overriding phase_status from the API
+# doesn't change the sheet's formatting conventions.
+_CTGOV_STATUS_DISPLAY = {
+    "COMPLETED": "Completed",
+    "RECRUITING": "Recruiting",
+    "NOT_YET_RECRUITING": "Not yet recruiting",
+    "ACTIVE_NOT_RECRUITING": "Active, not recruiting",
+    "ENROLLING_BY_INVITATION": "Enrolling by invitation",
+    "TERMINATED": "Terminated",
+    "WITHDRAWN": "Withdrawn",
+    "SUSPENDED": "Suspended",
+    "UNKNOWN": "Unknown status",
+    "AVAILABLE": "Available",
+    "NO_LONGER_AVAILABLE": "No longer available",
+    "APPROVED_FOR_MARKETING": "Approved for marketing",
+}
+
+
+async def _fetch_ctgov_authoritative(nct_ids: List[str]) -> Dict[str, Dict[str, str]]:
+    """Fetch OverallStatus, EnrollmentCount, StartDate and
+    PrimaryCompletionDate directly from the CT.gov API v2 for a batch of
+    NCT IDs — the single authoritative source for these fields.
+
+    WHY THIS EXISTS: manual verification found phase_status and trial_size
+    flipping between different values (e.g. Recruiting <-> Completed,
+    enrollment 300 <-> 626) for the SAME NCT ID across separate runs of
+    this pipeline, and one row showing phase_status "Completed" together
+    with a trial_completion_date in the FUTURE — a logical impossibility.
+    Both are symptoms of the same root cause: status and enrollment were
+    being taken from Gemini's free-text search interpretation, which can
+    vary run to run, instead of from the structured registry record. Dates
+    were already cross-checked against this API (see the call site below);
+    this extends the same authoritative-override treatment to status and
+    enrollment for CT.gov-native rows, where there is no ambiguity about
+    which source is correct.
+    """
+    if not nct_ids:
+        return {}
+
+    fields = "NCTId,OverallStatus,EnrollmentCount,StartDateStruct,PrimaryCompletionDateStruct"
+
+    async def fetch_one(session: aiohttp.ClientSession, nct_id: str):
+        url = f"https://clinicaltrials.gov/api/v2/studies/{nct_id}"
+        try:
+            async with session.get(url, params={"fields": fields},
+                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return nct_id, None
+                data = await resp.json()
+                protocol = data.get("protocolSection", {}) if isinstance(data, dict) else {}
+                status_mod = protocol.get("statusModule", {})
+                design_mod = protocol.get("designModule", {})
+                raw_status = status_mod.get("overallStatus", "") or ""
+                enrollment = design_mod.get("enrollmentInfo", {}).get("count")
+                start = status_mod.get("startDateStruct", {}).get("date") or ""
+                completion = status_mod.get("primaryCompletionDateStruct", {}).get("date") or ""
+                return nct_id, {
+                    "status": _CTGOV_STATUS_DISPLAY.get(raw_status.upper(), raw_status.title() if raw_status else ""),
+                    "enrollment": str(enrollment) if enrollment is not None else "",
+                    "start_date": start,
+                    "completion_date": completion,
+                }
+        except Exception as exc:
+            print(f"  [warn] CT.gov authoritative fetch failed for {nct_id}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return nct_id, None
+
+    results: Dict[str, Dict[str, str]] = {}
+    semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY)
+
+    async def bounded_fetch(session, nct_id):
+        async with semaphore:
+            return await fetch_one(session, nct_id)
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        pairs = await asyncio.gather(*[bounded_fetch(session, nid) for nid in nct_ids])
+    for nid, info in pairs:
+        if info:
+            results[nid] = info
+    return results
 
 
 async def _prefetch_registry_pages(
@@ -1230,19 +1320,12 @@ def _normalise_url(url: str) -> str:
     return url
 
 
-def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
-    """Copy efficacy data between rows that represent the SAME underlying
-    trial across registries, linked by either a shared URL or a
-    secondary/cross-reference ID.
-
-    Many EU CTIS/EudraCT entries and CT.gov entries point to the same
-    underlying clinicaltrials.gov study page — but not always via a URL
-    field: some EU registry scrapes list the linked NCT number in
-    "secondary_ids"/"other_ids" instead of (or in addition to) putting the
-    CT.gov URL in "url"/"source_url". Relying on URL alone can miss real
-    matches, so this links rows via BOTH signals (using union-find so a
-    chain of shared signals groups all related rows together) before
-    propagating. This is free — no Gemini calls needed.
+def _group_related_trial_ids(rows_by_id: Dict[str, Dict[str, Any]]) -> List[List[str]]:
+    """Group trial IDs that represent the SAME underlying trial across
+    registries, linked by either a shared URL or a secondary/cross-reference
+    ID (union-find, so a chain of shared signals groups all related rows
+    together). Shared by both the gap-filling propagation below and the
+    conflict-reconciliation pass that runs after it.
     """
     ids = list(rows_by_id.keys())
     parent = {tid: tid for tid in ids}
@@ -1291,9 +1374,21 @@ def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
     groups: Dict[str, List[str]] = {}
     for tid in ids:
         groups.setdefault(find(tid), []).append(tid)
+    return list(groups.values())
+
+
+def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Copy efficacy data between rows that represent the SAME underlying
+    trial across registries (see _group_related_trial_ids). Fills gaps
+    only — a recipient with NO efficacy data at all gets a data-rich
+    sibling's values. This is free — no Gemini calls needed. Disagreements
+    between rows that BOTH already have data are handled separately by
+    _reconcile_conflicting_efficacy, which runs after this.
+    """
+    groups = _group_related_trial_ids(rows_by_id)
 
     propagated = 0
-    for tids in groups.values():
+    for tids in groups:
         if len(tids) < 2:
             continue
         # Find a "donor" row that has efficacy data
@@ -1326,6 +1421,209 @@ def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
         print(f"  Cross-registry propagation: copied efficacy data to "
               f"{propagated} trial(s) sharing a URL or secondary ID with a "
               f"data-rich sibling", file=sys.stderr)
+
+
+# (value_field, duration_field) pairs — kept together everywhere a
+# conflict is resolved or an orphan duration is dropped, so a duration
+# never ends up detached from (or mismatched with) the value it belongs to.
+_EFFICACY_FIELD_PAIRS = [
+    ("hba1c_change_pct", "hba1c_duration"),
+    ("weight_change_pct", "weight_duration"),
+    ("alt_reduction_pct", "alt_duration"),
+    ("mash_resolution_pct", "mash_duration"),
+]
+
+
+def _reconcile_conflicting_efficacy(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Fix the "same trial, different numbers in different rows of the same
+    output" problem found during manual verification (e.g. REDEFINE 2 /
+    NCT05394519 showing HbA1c as 2.0, 2.2, AND 1.8 across its own CT.gov +
+    EU duplicate rows — only one of those can be right).
+
+    For every group of rows that represent the same underlying trial (see
+    _group_related_trial_ids), and for every efficacy value/duration pair:
+    if the group has MORE THAN ONE distinct non-empty value, that's an
+    internal contradiction, not a legitimate difference — the same trial
+    can't have two different real HbA1c changes. Resolve by majority vote
+    (the value repeated across the most rows/duplicate registry entries is
+    far more likely to be the one grounded in a real source, since a
+    one-off hallucination is unlikely to be independently repeated) and
+    apply that single value — value AND its paired duration together, as
+    a unit — to every row in the group, so the final output is internally
+    consistent. Every conflict is logged so it can be spot-checked rather
+    than silently trusted.
+    """
+    groups = _group_related_trial_ids(rows_by_id)
+    conflicts_found = 0
+
+    for tids in groups:
+        if len(tids) < 2:
+            continue
+        rows = [rows_by_id[tid] for tid in tids]
+
+        for value_field, duration_field in _EFFICACY_FIELD_PAIRS:
+            # Collect (value, duration) pairs as they actually co-occur on
+            # each row, keyed by the value string, so we resolve the value
+            # and its correct duration together rather than mixing and
+            # matching durations from different rows.
+            pair_by_value: Dict[str, str] = {}
+            votes: Dict[str, int] = {}
+            for row in rows:
+                val = str(row.get(value_field, "")).strip()
+                if not val:
+                    continue
+                dur = str(row.get(duration_field, "")).strip()
+                votes[val] = votes.get(val, 0) + 1
+                # Prefer the first duration seen paired with this value;
+                # if a later row has the same value but a non-empty
+                # duration and we don't have one yet, take it.
+                if val not in pair_by_value or (not pair_by_value[val] and dur):
+                    pair_by_value[val] = dur
+
+            distinct_values = list(votes.keys())
+            if len(distinct_values) <= 1:
+                continue  # no conflict — 0 or 1 distinct value, nothing to do
+
+            # Majority vote; ties broken by preferring the value that has a
+            # non-empty paired duration (more likely to have come from an
+            # actual source rather than a bare guess), then by the value
+            # itself for a stable, reproducible result.
+            def _sort_key(v: str):
+                return (-votes[v], 0 if pair_by_value.get(v) else 1, v)
+
+            winner = sorted(distinct_values, key=_sort_key)[0]
+            winner_duration = pair_by_value.get(winner, "")
+
+            conflicts_found += 1
+            print(f"  [warn] Conflicting {value_field} across {len(tids)} row(s) "
+                  f"for the same trial ({', '.join(tids)}): "
+                  f"{dict(votes)} — keeping {winner!r} "
+                  f"(majority vote) for all rows in this group", file=sys.stderr)
+
+            for row in rows:
+                row[value_field] = winner
+                row[duration_field] = winner_duration
+
+    if conflicts_found:
+        print(f"  Reconciled {conflicts_found} conflicting efficacy field(s) "
+              f"across duplicate-registry trial groups", file=sys.stderr)
+
+
+def _drop_orphan_durations(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Clear a duration field whenever its paired value field is empty.
+
+    A genuine extraction always has BOTH a number and the timepoint it was
+    measured at — Gemini reporting a duration with no accompanying value is
+    the signature of a hallucination (e.g. it saw "68 wk" as the trial's
+    overall duration somewhere and pasted it into an outcome-duration field
+    even though it never found — or the trial never reports — that
+    outcome). Dropping these prevents a misleading "at least we know the
+    timepoint" cell that implies data exists when it doesn't.
+    """
+    dropped = 0
+    for row in rows_by_id.values():
+        for value_field, duration_field in _EFFICACY_FIELD_PAIRS:
+            if not str(row.get(value_field, "")).strip() and str(row.get(duration_field, "")).strip():
+                row[duration_field] = ""
+                dropped += 1
+    if dropped:
+        print(f"  Dropped {dropped} orphan duration value(s) with no "
+              f"accompanying efficacy number (likely hallucinated)", file=sys.stderr)
+
+
+def _fix_mismatched_source_urls(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """A CT.gov-native row's source_url must point to that row's OWN NCT
+    ID. Gemini occasionally returns a URL for a different (similarly-named
+    or same-program) trial instead of echoing the ID it was given — e.g. a
+    row for NCT07253285 coming back with a source_url for NCT06532851.
+    When that happens, discard Gemini's URL and fall back to the registry
+    scraper's own url/source_url field (or, failing that, the canonical
+    clinicaltrials.gov URL built from the row's own trial_id) rather than
+    keep a URL that silently points a reader at the wrong trial.
+    """
+    nct_in_url = re.compile(r"NCT\d{8}", re.IGNORECASE)
+    fixed = 0
+    for tid, row in rows_by_id.items():
+        if not _is_ctgov_id(tid):
+            continue
+        url = str(row.get("source_url", "") or "")
+        match = nct_in_url.search(url)
+        if match and match.group(0).upper() == tid.upper():
+            continue  # URL matches this row's own ID — fine
+        if not url:
+            continue  # nothing to fix
+        # Mismatch (or a URL with no recognisable NCT ID at all) — revert
+        # to the registry's own url field if it correctly matches, else
+        # rebuild the canonical URL from the row's own trial_id.
+        registry_url = str(row.get("url", "") or "")
+        if nct_in_url.search(registry_url) and \
+           nct_in_url.search(registry_url).group(0).upper() == tid.upper():
+            row["source_url"] = registry_url
+        else:
+            row["source_url"] = f"https://clinicaltrials.gov/study/{tid}"
+        fixed += 1
+    if fixed:
+        print(f"  Fixed {fixed} source_url value(s) that pointed at a "
+              f"different trial's NCT ID than the row's own", file=sys.stderr)
+
+
+def _parse_loose_date(value: str) -> Optional[date]:
+    """Best-effort parse of the date formats actually seen in this
+    pipeline's output: ISO (YYYY-MM-DD), year-month (YYYY-MM), and the
+    DD/MM/YYYY style some EU CTIS/EudraCT rows come back in. Returns None
+    for anything unparseable rather than raising — this is only used for
+    a sanity check, not as a value written back to any row.
+    """
+    value = str(value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    m = re.match(r"^(\d{4})$", value)
+    if m:
+        return date(int(m.group(1)), 12, 31)
+    return None
+
+
+def _validate_dates_and_status(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Final safety-net sanity check across EVERY row, run last.
+
+    CT.gov-native rows already get status/dates overwritten from the
+    authoritative API above, so this should rarely fire for them — but EU
+    CTIS/EudraCT rows have no equivalent free structured API here, so a
+    row like "phase_status: Completed, trial_completion_date: 2027-05-28"
+    (a logical impossibility — it can't be Completed with a completion
+    date that hasn't happened yet) can still slip through for those.
+    Nothing is silently changed here (we have no authoritative source to
+    correct EU rows against) — this just prints a clear warning so the
+    row gets a human look rather than shipping unnoticed.
+    """
+    today_ = date.today()
+    flagged = 0
+    for tid, row in rows_by_id.items():
+        status = str(row.get("phase_status", "")).strip().lower()
+        completion = _parse_loose_date(row.get("trial_completion_date", ""))
+        start = _parse_loose_date(row.get("trial_start_date", ""))
+
+        if completion and status in ("completed", "terminated") and completion > today_:
+            print(f"  [warn] {tid}: phase_status is {row.get('phase_status')!r} but "
+                  f"trial_completion_date ({row.get('trial_completion_date')}) is in "
+                  f"the future — impossible combination, verify this row manually.",
+                  file=sys.stderr)
+            flagged += 1
+
+        if start and completion and start > completion:
+            print(f"  [warn] {tid}: trial_start_date ({row.get('trial_start_date')}) "
+                  f"is after trial_completion_date ({row.get('trial_completion_date')}) "
+                  f"— verify this row manually.", file=sys.stderr)
+            flagged += 1
+
+    if flagged:
+        print(f"  Date/status sanity check: flagged {flagged} row(s) above for "
+              f"manual review (see [warn] lines).", file=sys.stderr)
 
 
 def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int,
@@ -1469,28 +1767,60 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # doesn't, copy it across. This is free — no Gemini calls needed.
     _propagate_efficacy_by_url(rows_by_id)
 
-    # Cross-check Start/Completion Date against the authoritative CT.gov API
-    # (usually a no-op since ctgov_trials.py already used that API, but kept
-    # for parity in case Gemini overwrote them with guesses). This ONLY
-    # applies to CT.gov-native rows (NCT IDs) — the CT.gov API has no
-    # knowledge of EU CTIS/EudraCT trial numbers, so EU rows keep whatever
-    # dates their own registry scraper / Gemini already filled in.
+    # --- Pass 4 (no API calls): reconcile contradictions between rows that
+    # share the same underlying trial but ended up with DIFFERENT efficacy
+    # numbers (as opposed to Pass 3's gap-filling, this fixes disagreement).
+    _reconcile_conflicting_efficacy(rows_by_id)
+
+    # --- Pass 5 (no API calls): drop duration values with no accompanying
+    # efficacy number — a duration alone is a hallucination signature, not
+    # partial data (see _drop_orphan_durations).
+    _drop_orphan_durations(rows_by_id)
+
+    # --- Pass 6 (no API calls): fix any source_url that points at a
+    # different trial's NCT ID than the row it's attached to.
+    _fix_mismatched_source_urls(rows_by_id)
+
+    # Cross-check status, enrollment, and Start/Completion Date against the
+    # authoritative CT.gov API. This ONLY applies to CT.gov-native rows
+    # directly (NCT IDs) — the API has no knowledge of EU CTIS/EudraCT
+    # trial numbers. But an EU row is frequently just a duplicate entry for
+    # the SAME underlying trial (linked via source_url or a secondary NCT
+    # ID) — so once we have the authoritative values for the CT.gov row,
+    # propagate them to any EU row(s) in its group too, rather than leaving
+    # the EU duplicate on a stale/Gemini-guessed status while its own
+    # CT.gov row gets corrected.
     if ctgov_ids:
-        dates_map = await fetch_ctgov_dates(list(ctgov_ids))
-        for nct_id, dates in dates_map.items():
-            row = rows_by_id.get(nct_id)
-            if not row:
-                continue
-            # Only overwrite when the API actually returned something —
-            # don't blank out a good existing value (from the registry
-            # scraper or Gemini) just because this particular field came
-            # back empty/"N/A" from the API.
-            start = dates.get("Start Date", "")
-            completion = dates.get("Completion Date", "")
-            if start and str(start).strip().upper() not in ("N/A", ""):
-                row["trial_start_date"] = start
-            if completion and str(completion).strip().upper() not in ("N/A", ""):
-                row["trial_completion_date"] = completion
+        authoritative = await _fetch_ctgov_authoritative(list(ctgov_ids))
+        groups_by_tid = {tid: grp for grp in _group_related_trial_ids(rows_by_id) for tid in grp}
+        overridden = 0
+        for nct_id, info in authoritative.items():
+            targets = set(groups_by_tid.get(nct_id, [nct_id]))
+            targets.add(nct_id)
+            for target_id in targets:
+                row = rows_by_id.get(target_id)
+                if not row:
+                    continue
+                # Only overwrite when the API actually returned something —
+                # don't blank out a good existing value just because this
+                # particular field came back empty from the API.
+                if info.get("status"):
+                    row["phase_status"] = info["status"]
+                if info.get("enrollment"):
+                    row["trial_size"] = info["enrollment"]
+                if info.get("start_date"):
+                    row["trial_start_date"] = info["start_date"]
+                if info.get("completion_date"):
+                    row["trial_completion_date"] = info["completion_date"]
+            overridden += 1
+        print(f"  Cross-checked status/enrollment/dates against the CT.gov "
+              f"API for {overridden}/{len(ctgov_ids)} trial(s), propagated to "
+              f"any linked EU duplicate rows", file=sys.stderr)
+
+    # Final safety net: flag (not silently fix) any remaining row where the
+    # dates/status combination is logically impossible — mainly catches EU
+    # rows the authoritative override above can't reach.
+    _validate_dates_and_status(rows_by_id)
 
     return list(rows_by_id.values())
 
