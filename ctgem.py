@@ -73,9 +73,22 @@ RETRY_BATCH_SIZE = 1
 # candidate. (We deliberately don't retry on missing trial_title/phase/etc
 # — those are usually genuinely unavailable or already covered by the
 # registry scraper, and retrying for them wastes API calls.)
+#
+# IMPORTANT: this list must contain ONLY the actual clinical-outcome
+# fields (HbA1c / weight / ALT / MASH). "dosage" and "company_name" used
+# to be included here too, but that was a bug: Gemini's first pass almost
+# always finds the sponsor name and dosage (they're easy — right on the
+# registry page), which made _efficacy_missing() return False as soon as
+# those two were filled, even when every real outcome field was still
+# blank. That silently skipped Pass 2 (the focused single-trial retry)
+# for the majority of trials that actually needed it, which is why
+# Completed trials with real published results were still showing empty
+# hba1c/weight/alt/mash columns. dosage/company_name are still requested
+# from Gemini in the prompt — they're just no longer allowed to mask a
+# missing efficacy value.
 EFFICACY_ROW_FIELDS = [
-    "dosage", "hba1c_change_pct", "weight_change_pct",
-    "alt_reduction_pct", "mash_resolution_pct", "company_name",
+    "hba1c_change_pct", "weight_change_pct",
+    "alt_reduction_pct", "mash_resolution_pct",
 ]
 
 
@@ -546,8 +559,33 @@ def _extract_trial_acronym(title: str) -> str:
     return ""
 
 
+def _detect_acronym_collisions(rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Find program acronyms that resolve to more than one distinct trial_id
+    in this run (e.g. two unrelated trials both informally called
+    "REDEFINE 4" in press coverage). An acronym-based search is one of the
+    most effective ways to find press-release efficacy data (see
+    TRIAL ACRONYM SEARCH STRATEGY below) but it's also exactly the kind of
+    search that can silently misattribute a press release to the wrong
+    trial ID, or cause the model to give up as "ambiguous", when the
+    acronym isn't unique. Returns {acronym: [trial_id, ...]} only for
+    acronyms with 2+ distinct trial IDs.
+    """
+    acronym_to_ids: Dict[str, set] = {}
+    for row in rows:
+        tid = row.get("trial_id", "")
+        if not tid:
+            continue
+        title = (row.get("public_title", "") or row.get("title", "")
+                 or row.get("brief_title", "") or "")
+        acronym = _extract_trial_acronym(title)
+        if acronym:
+            acronym_to_ids.setdefault(acronym, set()).add(tid)
+    return {a: sorted(ids) for a, ids in acronym_to_ids.items() if len(ids) > 1}
+
+
 def _to_gemini_trial_stub(row: Dict[str, Any],
                           prefetched: Optional[Dict[str, str]] = None,
+                          acronym_collisions: Optional[Dict[str, List[str]]] = None,
                           ) -> Dict[str, str]:
     """Build a context-rich stub for Gemini's Step 2 prompt.
 
@@ -591,6 +629,20 @@ def _to_gemini_trial_stub(row: Dict[str, Any],
 
     if acronym:
         context_parts.append(f"Trial Acronym/Program: {acronym}")
+        if acronym_collisions and acronym in acronym_collisions:
+            other_ids = [i for i in acronym_collisions[acronym] if i != trial_id]
+            if other_ids:
+                context_parts.append(
+                    f"ACRONYM COLLISION WARNING: The program name/acronym "
+                    f"'{acronym}' is ALSO used (by outside press coverage) for "
+                    f"a DIFFERENT trial in this dataset: {', '.join(other_ids)}. "
+                    f"Before using any '{acronym}'-based search result for THIS "
+                    f"trial ({trial_id}), verify the source actually reports on "
+                    f"NCT/trial ID {trial_id} specifically (matching phase, "
+                    f"enrollment size, and countries below) — do not assign "
+                    f"results to this row if they actually belong to "
+                    f"{', '.join(other_ids)}."
+                )
 
     sponsor = row.get("sponsor", "") or row.get("lead_sponsor", "")
     if sponsor:
@@ -752,6 +804,31 @@ Do NOT skip the acronym search even if the registry page had no results —
 efficacy data is often in press releases and journal articles that only
 use the program name.
 
+PRESS-RELEASE WIRE SEARCH (do this even when the registry page shows no
+posted results — sponsors routinely announce topline efficacy numbers by
+press release MONTHS before the registry results section is updated):
+- Search: "<Sponsor>" + "<Acronym or Trial ID>" + "results"
+- Search: "<Sponsor>" + "<Acronym>" site:globenewswire.com OR site:prnewswire.com
+  OR site:businesswire.com — these wire services carry the large majority
+  of pharma trial-readout press releases and are usually indexed even for
+  very recent (same-month) announcements.
+- Search: "<Sponsor>" + "<indication>" + "phase 3" + "topline 20XX" (use the
+  current or preceding year)
+- Search: "<Molecule/Program>" + "vs" + "<comparator drug, if head-to-head>"
+  + "results" — head-to-head trials (e.g. against a competitor drug) are
+  often covered by trade press (e.g. clinicaltrialsarena.com, fiercebiotech
+  .com, endpoints news) even before the sponsor's own press release, and
+  that coverage frequently contains the exact efficacy numbers.
+
+DO NOT SKIP SEARCHING JUST BECAUSE REGISTRY STATUS LOOKS EARLY:
+The "Status" field in Registry_Context is a snapshot from when the
+registry was last scraped and can be STALE — a trial shown as "Recruiting"
+or "Active" here may have actually completed and reported results since
+that snapshot was taken. Never use "Status: Recruiting/Active" as a reason
+to skip the press-release and acronym searches above — search regardless
+of what the registry status says, and only conclude "N/A" after those
+searches turn up nothing.
+
 ALSO SEARCH USING THE SOURCE URL:
 If a "Source URL" or "Registry URL" is provided pointing to a
 clinicaltrials.gov or EU registry page, visit it directly (especially
@@ -797,9 +874,11 @@ ADDITIONAL SOURCE GUIDANCE FOR THIS BATCH (EU trials):
 ADDITIONAL SOURCE GUIDANCE FOR THIS BATCH (CT.gov trials):
 - "Trial ID" in your JSON response MUST be the EXACT NCT identifier given
   to you above for that trial, character-for-character — do not alter it.
-- If "Registry_Context" includes "Results Posted: True" or "Results Posted:
-  Yes", go directly to clinicaltrials.gov/study/<ID> → "Study Results" tab
-  to extract efficacy endpoints — don't stop at the summary page.
+- ALWAYS go to clinicaltrials.gov/study/<ID> → "Study Results" tab to check
+  for posted efficacy endpoints — don't stop at the summary page, and don't
+  skip this because Registry_Context doesn't show "Results Posted: True":
+  that flag reflects an old scrape snapshot and can be wrong for a trial
+  that has since completed and posted results.
 """,
 }
 
@@ -828,7 +907,16 @@ returned no efficacy data for this trial. Before answering:
    - Search for: "<Sponsor Name>" + "<Conditions>" + "phase <N>" + "efficacy"
    - Search for: "<Trial ID>" + "HbA1c" / "weight loss" / "ALT" / "MASH"
    - Search for: "<Sponsor Name>" + "<Program Name>" + "press release"
-   - Search for: "<Sponsor Name>" + "<Program Name>" + site:pubmed.ncbi.nlm.nih.gov
+   - Search for: "<Sponsor Name>" + "<Program Name>" site:globenewswire.com
+     OR site:prnewswire.com OR site:businesswire.com — wire services carry
+     most pharma topline-result announcements and index them fast, often
+     the SAME MONTH as the announcement.
+   - Search for: "<Sponsor Name>" + "<Program Name>" site:pubmed.ncbi.nlm.nih.gov
+   - If this is a head-to-head trial against a named comparator drug, also
+     search: "<Program Name>" + "vs" + "<comparator>" + "results" — trade
+     press (clinicaltrialsarena.com, fiercebiotech.com, endpts.com) often
+     covers head-to-head readouts, sometimes ahead of the sponsor's own
+     release, and usually states the exact numbers.
    Company press releases and conference abstracts (ADA, EASD, AASLD,
    ENDO) often report efficacy numbers before the formal registry results
    page is updated.
@@ -840,6 +928,11 @@ returned no efficacy data for this trial. Before answering:
    primary one.
 6. Try the sponsor's investor relations / pipeline page — many companies
    post topline data there before peer-reviewed publication.
+7. Do NOT let "Status: Recruiting" or "Status: Active" in Registry_Context
+   talk you out of searching — that status can be a stale snapshot from
+   when the registry was scraped. A trial can complete and have its topline
+   results covered by press within days, well before any registry page or
+   scrape catches up. Search regardless of what the status field says.
 Only use "N/A" if you've checked the above and the trial genuinely has no
 completed results yet (e.g. still recruiting, or terminated with no
 posted data) — don't default to "N/A" just because the summary page alone
@@ -977,24 +1070,69 @@ def _normalise_url(url: str) -> str:
 
 
 def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
-    """Copy efficacy data between trials that share the same source_url.
+    """Copy efficacy data between rows that represent the SAME underlying
+    trial across registries, linked by either a shared URL or a
+    secondary/cross-reference ID.
 
     Many EU CTIS/EudraCT entries and CT.gov entries point to the same
-    underlying clinicaltrials.gov study page. If one row has efficacy data
-    and another sharing the same URL doesn't, propagate the data across.
-    This is free — no Gemini calls needed.
+    underlying clinicaltrials.gov study page — but not always via a URL
+    field: some EU registry scrapes list the linked NCT number in
+    "secondary_ids"/"other_ids" instead of (or in addition to) putting the
+    CT.gov URL in "url"/"source_url". Relying on URL alone can miss real
+    matches, so this links rows via BOTH signals (using union-find so a
+    chain of shared signals groups all related rows together) before
+    propagating. This is free — no Gemini calls needed.
     """
-    # Build URL -> list of trial_ids mapping
+    ids = list(rows_by_id.keys())
+    parent = {tid: tid for tid in ids}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Link via shared normalised URL.
     url_to_ids: Dict[str, List[str]] = {}
     for tid, row in rows_by_id.items():
         for url_key in ("url", "source_url"):
-            raw_url = row.get(url_key, "")
-            norm = _normalise_url(raw_url)
+            norm = _normalise_url(row.get(url_key, ""))
             if norm:
                 url_to_ids.setdefault(norm, []).append(tid)
+    for tids in url_to_ids.values():
+        for other in tids[1:]:
+            union(tids[0], other)
+
+    # Link via a secondary/cross-reference ID that names another trial_id
+    # already in this run (most commonly an EU row listing its CT.gov NCT
+    # number, or vice versa).
+    nct_pattern = re.compile(r"\bNCT\d{8}\b", re.IGNORECASE)
+    for tid, row in rows_by_id.items():
+        secondary = str(row.get("secondary_ids", "") or row.get("other_ids", ""))
+        if not secondary:
+            continue
+        for match in nct_pattern.findall(secondary):
+            match_norm = match.upper()
+            if match_norm in rows_by_id and match_norm != tid:
+                union(tid, match_norm)
+        # Also check for a bare EU CTIS-style number (YYYY-NNNNNN-NN-NN) or
+        # legacy EudraCT number (YYYY-NNNNNN-NN) embedded in the secondary
+        # IDs of a CT.gov row, in case the linkage runs the other direction.
+        for other_tid in rows_by_id:
+            if other_tid != tid and other_tid in secondary:
+                union(tid, other_tid)
+
+    groups: Dict[str, List[str]] = {}
+    for tid in ids:
+        groups.setdefault(find(tid), []).append(tid)
 
     propagated = 0
-    for norm_url, tids in url_to_ids.items():
+    for tids in groups.values():
         if len(tids) < 2:
             continue
         # Find a "donor" row that has efficacy data
@@ -1024,18 +1162,22 @@ def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
                 propagated += 1
 
     if propagated:
-        print(f"  URL propagation: copied efficacy data to {propagated} "
-              f"trial(s) sharing URLs with data-rich siblings", file=sys.stderr)
+        print(f"  Cross-registry propagation: copied efficacy data to "
+              f"{propagated} trial(s) sharing a URL or secondary ID with a "
+              f"data-rich sibling", file=sys.stderr)
 
 
 def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int,
-                     prefetched: Optional[Dict[str, str]] = None) -> List[tuple]:
+                     prefetched: Optional[Dict[str, str]] = None,
+                     acronym_collisions: Optional[Dict[str, List[str]]] = None) -> List[tuple]:
     rows_by_source: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
         rows_by_source.setdefault(r.get("registry_source", "ctgov"), []).append(r)
     batches: List[tuple] = []
     for source, source_rows in rows_by_source.items():
-        stubs = [_to_gemini_trial_stub(r, prefetched=prefetched) for r in source_rows]
+        stubs = [_to_gemini_trial_stub(r, prefetched=prefetched,
+                                        acronym_collisions=acronym_collisions)
+                 for r in source_rows]
         for i in range(0, len(stubs), batch_size):
             batches.append((source, stubs[i:i + batch_size]))
     return batches
@@ -1081,9 +1223,22 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # to re-find a page we already have the URL for.
     prefetched = await _prefetch_registry_pages(list(rows_by_id.values()))
 
+    # Detect acronym collisions (e.g. two unrelated trials both informally
+    # called "REDEFINE 4" in outside press coverage) so the per-trial prompt
+    # can warn Gemini to verify a match before assigning press-release data
+    # to the wrong row.
+    acronym_collisions = _detect_acronym_collisions(list(rows_by_id.values()))
+    if acronym_collisions:
+        for acronym, ids in acronym_collisions.items():
+            print(f"  [warn] Acronym/program name '{acronym}' matches "
+                  f"{len(ids)} distinct trial(s) in this run: {', '.join(ids)} "
+                  f"— disambiguation warning added to their prompts.",
+                  file=sys.stderr)
+
     # --- Pass 1: normal batching, smaller batch size for research depth ---
     batches = _chunk_by_source(list(rows_by_id.values()), FIRST_PASS_BATCH_SIZE,
-                                prefetched=prefetched)
+                                prefetched=prefetched,
+                                acronym_collisions=acronym_collisions)
     print(f"  Sending {len(rows_by_id)} trial(s) to Gemini in {len(batches)} "
           f"batch(es) of up to {FIRST_PASS_BATCH_SIZE} ...", file=sys.stderr)
     enriched_trials = await _run_batches(drug, batches, label="pass1")
@@ -1121,7 +1276,8 @@ async def enrich(drug: str, max_records: Optional[int] = None,
                   f"{core_missing} missing core fields), "
                   f"1 trial/call, deep-dive prompt ...", file=sys.stderr)
             retry_batches = _chunk_by_source(retry_rows, RETRY_BATCH_SIZE,
-                                              prefetched=prefetched)
+                                              prefetched=prefetched,
+                                              acronym_collisions=acronym_collisions)
             retry_enriched = await _run_batches(drug, retry_batches,
                                                  extra_suffix=DEEP_DIVE_SUFFIX, label="pass2")
             retry_matched = _merge_enriched(retry_enriched, rows_by_id)
