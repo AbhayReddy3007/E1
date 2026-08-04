@@ -243,6 +243,38 @@ def _clean_trial_id(raw_id: str) -> str:
     return raw_id.split("(")[0].strip().split(" ")[0].strip()
 
 
+def _is_combination_molecule(drug: str) -> bool:
+    """Heuristic: does this molecule name look like a fixed-dose
+    combination (e.g. "Cagrilintide+Semaglutide", "Cagrilintide + Semaglutide")
+    rather than a single active ingredient?"""
+    return bool(re.search(r"\+|\band\b", drug, flags=re.IGNORECASE))
+
+
+# gemini_extractor.py's Step 2 prompt opens with a validation gate:
+# "verify each trial is a {molecule} MONOTHERAPY trial ... SKIP trials
+# testing combination drugs (e.g., CagriSema = Cagrilintide + Semaglutide
+# should be EXCLUDED when searching for Semaglutide)". That's written for
+# single-ingredient searches, where you WANT combination trials filtered
+# out. If {molecule} is itself passed in as a combination name (e.g.
+# "Cagrilintide+Semaglutide"), that same instruction — with your exact
+# molecule spelled out as the example of what to exclude — pushes Gemini
+# to under-extract or blank out efficacy data for the very trials you're
+# asking about. This override is appended whenever the molecule name looks
+# like a combination, telling Gemini the monotherapy filter doesn't apply.
+COMBINATION_OVERRIDE = """
+OVERRIDE ON THE MONOTHERAPY VALIDATION INSTRUCTION ABOVE:
+The molecule under study here IS a fixed-dose combination product. The
+earlier instruction to SKIP/exclude "combination drug" trials does NOT
+apply in this case — every trial ID given to you below was already
+confirmed to test this exact combination as its primary intervention.
+Do not decline, blank out, or under-extract efficacy fields for these
+trials on the basis that they involve a drug combination. Extract HbA1c
+change, weight loss, ALT reduction, MASH outcome, dosage, etc. exactly as
+you would for any other Phase 2/3 trial with the combination as the
+tested product.
+"""
+
+
 # gemini_extractor.py's Step 2 prompt is written CT.gov-first: its own
 # example for the "Trial ID" output field is an NCT number, its example
 # "Source URL" is a clinicaltrials.gov URL, and its DATA SOURCES list
@@ -327,6 +359,10 @@ async def _run_batches(drug: str, batches: List[tuple], extra_suffix: str = "",
     concurrently (bounded by MAX_WORKERS) and return the flattened trial list."""
     semaphore = asyncio.Semaphore(MAX_WORKERS)
 
+    # Applied to every batch regardless of source when the molecule name
+    # looks like a fixed-dose combination — see COMBINATION_OVERRIDE above.
+    combo_suffix = COMBINATION_OVERRIDE if _is_combination_molecule(drug) else ""
+
     async def run_batch(idx: int, source: str, batch: List[Dict[str, str]]):
         async with semaphore:
             stagger = (idx % MAX_WORKERS) * (RATE_LIMIT_DELAY / MAX_WORKERS)
@@ -334,7 +370,8 @@ async def _run_batches(drug: str, batches: List[tuple], extra_suffix: str = "",
                 await asyncio.sleep(stagger)
             print(f"  [{label}] Batch {idx + 1}/{len(batches)} [{source}] "
                   f"({len(batch)} trials) - starting", file=sys.stderr)
-            extra_prompt = (EXTRA_PROMPT_BY_SOURCE.get(source, "") + extra_suffix) or None
+            extra_prompt = (EXTRA_PROMPT_BY_SOURCE.get(source, "")
+                             + combo_suffix + extra_suffix) or None
             data = await get_trial_details(drug, batch, extra_fields_prompt=extra_prompt)
             trials = data.get("trials", [])
             print(f"  [{label}] Batch {idx + 1}/{len(batches)} [{source}] - done "
@@ -361,7 +398,12 @@ def _merge_enriched(enriched_trials: List[Dict[str, Any]],
             continue
         for gemini_field, row_field in GEMINI_FIELD_MAP.items():
             value = trial.get(gemini_field)
-            if value and str(value).strip() not in ("", "N/A", "n/a"):
+            # Compare the STRING form, not the raw value — a numeric 0
+            # (e.g. Gemini returning a bare 0 instead of "0") is falsy in
+            # Python and would otherwise get silently skipped by `if value`,
+            # even though "0" can be a legitimate (if rare) result.
+            value_str = str(value).strip() if value is not None else ""
+            if value_str and value_str not in ("N/A", "n/a", "None"):
                 row[row_field] = value
         matched_ids.add(trial_id)
     return matched_ids
@@ -401,6 +443,11 @@ async def enrich(drug: str, max_records: Optional[int] = None,
 
     if not rows:
         return []
+
+    if _is_combination_molecule(drug):
+        print(f"  [info] '{drug}' looks like a fixed-dose combination — appending "
+              f"COMBINATION_OVERRIDE to every Gemini batch so the built-in monotherapy "
+              f"filter doesn't exclude/blank these trials.", file=sys.stderr)
 
     # trial_id namespaces don't overlap across sources (NCT######## vs.
     # CTIS CT numbers vs. EudraCT numbers), so a single dict keyed by
