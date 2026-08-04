@@ -372,6 +372,31 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
     }
 
 
+def _extract_trial_acronym(title: str) -> str:
+    """Try to extract a trial program acronym from the title.
+
+    Many trials embed their program name in parentheses at the end of the
+    title, e.g. "... Lose Weight (REDUCE-1)" or have well-known naming
+    patterns like REDEFINE, REIMAGINE, STEP, SURPASS, SURMOUNT, etc.
+    The acronym is far more searchable than the NCT ID in press releases
+    and publications.
+    """
+    if not title:
+        return ""
+    # Pattern 1: explicit parenthesized acronym at end of title
+    m = re.search(r"\(([A-Z][A-Z0-9 _-]{1,30}(?:\s*\d+)?)\)\s*$", title)
+    if m:
+        return m.group(1).strip()
+    # Pattern 2: known program names anywhere in title
+    for prog in ("REDEFINE", "REIMAGINE", "REDUCE", "STEP", "SURPASS",
+                 "SURMOUNT", "PIONEER", "SUSTAIN", "FLOW", "SELECT",
+                 "SUMMIT", "ESSENCE"):
+        pat = re.search(rf"\b({prog}\s*[-]?\s*\d*)\b", title, re.IGNORECASE)
+        if pat:
+            return pat.group(1).strip().upper()
+    return ""
+
+
 def _to_gemini_trial_stub(row: Dict[str, Any],
                           prefetched: Optional[Dict[str, str]] = None,
                           ) -> Dict[str, str]:
@@ -400,8 +425,23 @@ def _to_gemini_trial_stub(row: Dict[str, Any],
     program_name = (row.get("public_title", "") or row.get("title", "")
                     or row.get("brief_title", "") or "N/A")
 
+    # Extract trial acronym (e.g. "REDEFINE 1", "REIMAGINE 2") — far more
+    # searchable in press releases and publications than the NCT ID.
+    acronym = _extract_trial_acronym(program_name)
+    if not acronym:
+        # Try the other title fields too
+        for alt_key in ("title", "public_title", "brief_title"):
+            alt_title = row.get(alt_key, "")
+            if alt_title and alt_title != program_name:
+                acronym = _extract_trial_acronym(alt_title)
+                if acronym:
+                    break
+
     # Collect every useful field the registry already gave us.
     context_parts: List[str] = []
+
+    if acronym:
+        context_parts.append(f"Trial Acronym/Program: {acronym}")
 
     sponsor = row.get("sponsor", "") or row.get("lead_sponsor", "")
     if sponsor:
@@ -448,6 +488,10 @@ def _to_gemini_trial_stub(row: Dict[str, Any],
     url = row.get("url", "")
     if url:
         context_parts.append(f"Registry URL: {url}")
+
+    source_url = row.get("source_url", "")
+    if source_url and source_url != url:
+        context_parts.append(f"Source URL: {source_url}")
 
     # Secondary IDs help Gemini cross-reference across registries
     secondary_ids = row.get("secondary_ids", "") or row.get("other_ids", "")
@@ -546,6 +590,26 @@ fields most likely to require digging into results pages, press releases,
 and published papers. The rest are usually already filled in from the
 registry metadata.
 
+TRIAL ACRONYM SEARCH STRATEGY:
+If "Trial Acronym/Program" is provided (e.g. "REDEFINE 1", "REIMAGINE 2",
+"STEP 1", "REDUCE-1"), ALWAYS search for the acronym — it is FAR more
+discoverable than the NCT ID in press releases and publications:
+- Search: "<Acronym>" + "<molecule>" + "results" (e.g. "REDEFINE 1 CagriSema results")
+- Search: "<Acronym>" + "weight loss" / "HbA1c" / "efficacy"
+- Search: "<Acronym>" + "phase 3" + "topline"
+- Search: "<Acronym>" + site:nejm.org OR site:thelancet.com OR site:pubmed.ncbi.nlm.nih.gov
+Press releases almost always reference the trial acronym, not the NCT ID.
+Do NOT skip the acronym search even if the registry page had no results —
+efficacy data is often in press releases and journal articles that only
+use the program name.
+
+ALSO SEARCH USING THE SOURCE URL:
+If a "Source URL" or "Registry URL" is provided pointing to a
+clinicaltrials.gov or EU registry page, visit it directly (especially
+the Results tab) BEFORE falling back to text searches. Many completed
+trials have structured results data posted on their registry page that
+is not in the summary view.
+
 PRE-FETCHED PAGE CONTENT:
 Some trials include a "Prefetched_Page_Content" field containing text
 already extracted from the trial's official registry page. When present:
@@ -598,10 +662,19 @@ ADDITIONAL SOURCE GUIDANCE FOR THIS BATCH (CT.gov trials):
 DEEP_DIVE_SUFFIX = """
 DEEP-DIVE MODE — this is a single-trial retry because the first pass
 returned no efficacy data for this trial. Before answering:
-1. Open the trial's own results page (e.g. clinicaltrials.gov/study/<ID>
+1. If a "Trial Acronym/Program" is in Registry_Context (e.g. REDEFINE 1,
+   REIMAGINE 2), START HERE — search for:
+   - "<Acronym> results" (e.g. "REDEFINE 1 results")
+   - "<Acronym> <molecule> weight loss HbA1c"
+   - "<Acronym> topline" or "<Acronym> headline results"
+   - "<Acronym> NEJM" or "<Acronym> Lancet" or "<Acronym> published"
+   These searches almost always find press releases and publications that
+   contain the exact efficacy numbers.
+2. Open the trial's own results page (e.g. clinicaltrials.gov/study/<ID>
    -> "Study Results" tab; or the EU registry's results page) — not just
-   the summary/protocol page.
-2. USE THE REGISTRY_CONTEXT provided below to build precise searches:
+   the summary/protocol page. Also try the Source URL if different from
+   the Registry URL.
+3. USE THE REGISTRY_CONTEXT provided below to build precise searches:
    - Search for: "<Sponsor Name>" + "<Program Name>" + "results" / "topline"
    - Search for: "<Sponsor Name>" + "<Conditions>" + "phase <N>" + "efficacy"
    - Search for: "<Trial ID>" + "HbA1c" / "weight loss" / "ALT" / "MASH"
@@ -610,13 +683,13 @@ returned no efficacy data for this trial. Before answering:
    Company press releases and conference abstracts (ADA, EASD, AASLD,
    ENDO) often report efficacy numbers before the formal registry results
    page is updated.
-3. Check for a linked publication (PubMed, NEJM, Lancet, Diabetes Care,
+4. Check for a linked publication (PubMed, NEJM, Lancet, Diabetes Care,
    Hepatology, JAMA, etc.) — trial result papers usually report exact
    efficacy numbers even when the registry page only shows "N/A".
-4. If the trial has secondary IDs listed in Registry_Context, search for
+5. If the trial has secondary IDs listed in Registry_Context, search for
    those IDs too — some publications cite the secondary ID rather than the
    primary one.
-5. Try the sponsor's investor relations / pipeline page — many companies
+6. Try the sponsor's investor relations / pipeline page — many companies
    post topline data there before peer-reviewed publication.
 Only use "N/A" if you've checked the above and the trial genuinely has no
 completed results yet (e.g. still recruiting, or terminated with no
@@ -697,6 +770,69 @@ def _merge_enriched(enriched_trials: List[Dict[str, Any]],
                 row[row_field] = value
         matched_ids.add(trial_id)
     return matched_ids
+
+
+def _normalise_url(url: str) -> str:
+    """Normalise a registry URL for matching: strip trailing slash,
+    lowercase, remove protocol and www prefix."""
+    if not url:
+        return ""
+    url = url.strip().rstrip("/").lower()
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    return url
+
+
+def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Copy efficacy data between trials that share the same source_url.
+
+    Many EU CTIS/EudraCT entries and CT.gov entries point to the same
+    underlying clinicaltrials.gov study page. If one row has efficacy data
+    and another sharing the same URL doesn't, propagate the data across.
+    This is free — no Gemini calls needed.
+    """
+    # Build URL -> list of trial_ids mapping
+    url_to_ids: Dict[str, List[str]] = {}
+    for tid, row in rows_by_id.items():
+        for url_key in ("url", "source_url"):
+            raw_url = row.get(url_key, "")
+            norm = _normalise_url(raw_url)
+            if norm:
+                url_to_ids.setdefault(norm, []).append(tid)
+
+    propagated = 0
+    for norm_url, tids in url_to_ids.items():
+        if len(tids) < 2:
+            continue
+        # Find a "donor" row that has efficacy data
+        donor = None
+        for tid in tids:
+            if not _efficacy_missing(rows_by_id[tid]):
+                donor = rows_by_id[tid]
+                break
+        if donor is None:
+            continue
+        # Propagate to recipients that are missing efficacy data
+        for tid in tids:
+            recipient = rows_by_id[tid]
+            if _efficacy_missing(recipient) and recipient is not donor:
+                for field in EFFICACY_ROW_FIELDS:
+                    donor_val = str(donor.get(field, "")).strip()
+                    recip_val = str(recipient.get(field, "")).strip()
+                    if donor_val and not recip_val:
+                        recipient[field] = donor[field]
+                # Also propagate duration fields
+                for dur_field in ("hba1c_duration", "weight_duration",
+                                  "alt_duration", "mash_duration"):
+                    donor_val = str(donor.get(dur_field, "")).strip()
+                    recip_val = str(recipient.get(dur_field, "")).strip()
+                    if donor_val and not recip_val:
+                        recipient[dur_field] = donor[dur_field]
+                propagated += 1
+
+    if propagated:
+        print(f"  URL propagation: copied efficacy data to {propagated} "
+              f"trial(s) sharing URLs with data-rich siblings", file=sys.stderr)
 
 
 def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int,
@@ -794,6 +930,13 @@ async def enrich(drug: str, max_records: Optional[int] = None,
                   file=sys.stderr)
         else:
             print("  Pass 2: skipped — no trials missing efficacy data.", file=sys.stderr)
+
+    # --- Pass 3 (no API calls): cross-URL efficacy propagation ---
+    # Many EU CTIS/EudraCT entries share the same source_url as a CT.gov
+    # trial (e.g. both point to the same clinicaltrials.gov/study/NCTxxx
+    # page). If the CT.gov row already has efficacy data but the EU row
+    # doesn't, copy it across. This is free — no Gemini calls needed.
+    _propagate_efficacy_by_url(rows_by_id)
 
     # Cross-check Start/Completion Date against the authoritative CT.gov API
     # (usually a no-op since ctgov_trials.py already used that API, but kept
