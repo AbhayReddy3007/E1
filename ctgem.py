@@ -293,6 +293,7 @@ FINAL_COLUMNS = [
     "molecule_name",
     "registry_source",
     "trial_id",
+    "trial_acronym",
     "dosage",
     "phase",
     "trial_title",
@@ -345,6 +346,7 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
         "molecule_name": drug,
         "registry_source": row.get("source", "") or row.get("registry_source", ""),
         "trial_id": row.get("trial_id", ""),
+        "trial_acronym": row.get("trial_acronym", ""),
         "dosage": row.get("dosage", ""),
         "phase": normalise_phase(row.get("phase", "")),
         "trial_title": (row.get("trial_title", "") or row.get("title", "")
@@ -395,6 +397,109 @@ def _extract_trial_acronym(title: str) -> str:
         if pat:
             return pat.group(1).strip().upper()
     return ""
+
+
+async def _fetch_ctgov_acronyms(nct_ids: List[str]) -> Dict[str, str]:
+    """Fetch official acronyms from the ClinicalTrials.gov API v2.
+
+    The API exposes protocolSection.identificationModule.acronym which is
+    the authoritative trial acronym (e.g. "REDEFINE 1", "REIMAGINE 2").
+    We batch up to 50 IDs per request using the filter query.
+    Returns a dict mapping NCT ID -> acronym (only for IDs that have one).
+    """
+    result: Dict[str, str] = {}
+    if not nct_ids:
+        return result
+
+    batch_size = 50
+    base_url = "https://clinicaltrials.gov/api/v2/studies"
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30)
+    ) as session:
+        for i in range(0, len(nct_ids), batch_size):
+            batch = nct_ids[i:i + batch_size]
+            ids_filter = " OR ".join(batch)
+            params = {
+                "query.id": ids_filter,
+                "fields": "protocolSection.identificationModule.nctId,"
+                          "protocolSection.identificationModule.acronym,"
+                          "protocolSection.identificationModule.officialTitle,"
+                          "protocolSection.identificationModule.briefTitle",
+                "pageSize": str(len(batch)),
+            }
+            try:
+                async with session.get(base_url, params=params) as resp:
+                    if resp.status != 200:
+                        print(f"    [acronym] CT.gov API returned {resp.status}",
+                              file=sys.stderr)
+                        continue
+                    data = await resp.json()
+                    for study in data.get("studies", []):
+                        id_mod = (study.get("protocolSection", {})
+                                       .get("identificationModule", {}))
+                        nct_id = id_mod.get("nctId", "")
+                        acronym = id_mod.get("acronym", "")
+                        if not acronym:
+                            # Fall back to extracting from titles
+                            for title_key in ("officialTitle", "briefTitle"):
+                                acronym = _extract_trial_acronym(
+                                    id_mod.get(title_key, ""))
+                                if acronym:
+                                    break
+                        if nct_id and acronym:
+                            result[nct_id] = acronym.strip()
+            except Exception as exc:
+                print(f"    [acronym] CT.gov API error: {exc}", file=sys.stderr)
+
+    return result
+
+
+def _assign_acronyms(rows_by_id: Dict[str, Dict[str, Any]],
+                     api_acronyms: Dict[str, str]) -> None:
+    """Assign trial_acronym to every row using multiple strategies:
+    1. CT.gov API acronym (most authoritative)
+    2. Extract from title fields
+    3. Extract from source_url's NCT ID -> API acronym mapping
+    """
+    # Build a map from source_url NCT IDs to acronyms for EU trial cross-ref
+    url_nct_map: Dict[str, str] = {}
+    for nct_id, acronym in api_acronyms.items():
+        url_nct_map[nct_id.upper()] = acronym
+
+    for tid, row in rows_by_id.items():
+        acronym = ""
+
+        # Strategy 1: direct API match (CT.gov rows)
+        if tid in api_acronyms:
+            acronym = api_acronyms[tid]
+
+        # Strategy 2: extract NCT ID from source_url and look up
+        if not acronym:
+            source_url = row.get("source_url", "") or row.get("url", "")
+            url_nct = _extract_nct_from_url(source_url)
+            if url_nct and url_nct.upper() in url_nct_map:
+                acronym = url_nct_map[url_nct.upper()]
+
+        # Strategy 3: extract from title fields
+        if not acronym:
+            for title_key in ("public_title", "title", "brief_title",
+                              "trial_title"):
+                title = row.get(title_key, "")
+                if title:
+                    acronym = _extract_trial_acronym(title)
+                    if acronym:
+                        break
+
+        row["trial_acronym"] = acronym
+
+
+def _extract_nct_from_url(url: str) -> str:
+    """Extract an NCT ID from a clinicaltrials.gov URL."""
+    if not url:
+        return ""
+    m = re.search(r"(NCT\d{8,})", url, re.IGNORECASE)
+    return m.group(1).upper() if m else ""
 
 
 def _to_gemini_trial_stub(row: Dict[str, Any],
@@ -784,7 +889,8 @@ def _normalise_url(url: str) -> str:
 
 
 def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
-    """Copy efficacy data between trials that share the same source_url.
+    """Copy efficacy data between trials that share the same source_url
+    or whose source_url points to the same NCT ID.
 
     Many EU CTIS/EudraCT entries and CT.gov entries point to the same
     underlying clinicaltrials.gov study page. If one row has efficacy data
@@ -800,39 +906,132 @@ def _propagate_efficacy_by_url(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
             if norm:
                 url_to_ids.setdefault(norm, []).append(tid)
 
+    # Also group by NCT ID extracted from source_url — this catches EU
+    # trials whose source_url is a clinicaltrials.gov link
+    nct_to_ids: Dict[str, List[str]] = {}
+    for tid, row in rows_by_id.items():
+        # The row itself might be an NCT row
+        if _is_ctgov_id(tid):
+            nct_to_ids.setdefault(tid.upper(), []).append(tid)
+        # Also extract NCT from URL fields
+        for url_key in ("url", "source_url"):
+            nct_from_url = _extract_nct_from_url(row.get(url_key, ""))
+            if nct_from_url:
+                nct_to_ids.setdefault(nct_from_url.upper(), []).append(tid)
+
     propagated = 0
+
+    # Propagate by URL
     for norm_url, tids in url_to_ids.items():
-        if len(tids) < 2:
+        if len(set(tids)) < 2:
             continue
-        # Find a "donor" row that has efficacy data
+        unique_tids = list(dict.fromkeys(tids))  # dedupe preserving order
         donor = None
-        for tid in tids:
+        for tid in unique_tids:
             if not _efficacy_missing(rows_by_id[tid]):
                 donor = rows_by_id[tid]
                 break
         if donor is None:
             continue
-        # Propagate to recipients that are missing efficacy data
-        for tid in tids:
+        for tid in unique_tids:
             recipient = rows_by_id[tid]
             if _efficacy_missing(recipient) and recipient is not donor:
-                for field in EFFICACY_ROW_FIELDS:
-                    donor_val = str(donor.get(field, "")).strip()
-                    recip_val = str(recipient.get(field, "")).strip()
-                    if donor_val and not recip_val:
-                        recipient[field] = donor[field]
-                # Also propagate duration fields
-                for dur_field in ("hba1c_duration", "weight_duration",
-                                  "alt_duration", "mash_duration"):
-                    donor_val = str(donor.get(dur_field, "")).strip()
-                    recip_val = str(recipient.get(dur_field, "")).strip()
-                    if donor_val and not recip_val:
-                        recipient[dur_field] = donor[dur_field]
-                propagated += 1
+                propagated += _copy_efficacy(donor, recipient)
+
+    # Propagate by NCT ID
+    for nct_id, tids in nct_to_ids.items():
+        if len(set(tids)) < 2:
+            continue
+        unique_tids = list(dict.fromkeys(tids))
+        donor = None
+        for tid in unique_tids:
+            if not _efficacy_missing(rows_by_id[tid]):
+                donor = rows_by_id[tid]
+                break
+        if donor is None:
+            continue
+        for tid in unique_tids:
+            recipient = rows_by_id[tid]
+            if _efficacy_missing(recipient) and recipient is not donor:
+                propagated += _copy_efficacy(donor, recipient)
 
     if propagated:
-        print(f"  URL propagation: copied efficacy data to {propagated} "
-              f"trial(s) sharing URLs with data-rich siblings", file=sys.stderr)
+        print(f"  URL/NCT propagation: copied efficacy data to {propagated} "
+              f"trial(s) sharing URLs/NCT IDs with data-rich siblings",
+              file=sys.stderr)
+
+
+def _copy_efficacy(donor: Dict[str, Any], recipient: Dict[str, Any]) -> int:
+    """Copy efficacy + duration fields from donor to recipient.
+    Returns 1 if any field was copied, 0 otherwise."""
+    copied = False
+    for field in EFFICACY_ROW_FIELDS:
+        donor_val = str(donor.get(field, "")).strip()
+        recip_val = str(recipient.get(field, "")).strip()
+        if donor_val and not recip_val:
+            recipient[field] = donor[field]
+            copied = True
+    for dur_field in ("hba1c_duration", "weight_duration",
+                      "alt_duration", "mash_duration"):
+        donor_val = str(donor.get(dur_field, "")).strip()
+        recip_val = str(recipient.get(dur_field, "")).strip()
+        if donor_val and not recip_val:
+            recipient[dur_field] = donor[dur_field]
+            copied = True
+    return 1 if copied else 0
+
+
+def _is_completed_or_has_results(row: Dict[str, Any]) -> bool:
+    """Check whether a trial is completed or likely has results available."""
+    status = str(row.get("status", "") or row.get("phase_status", "")
+                 or row.get("overall_status", "")).lower()
+    if any(kw in status for kw in ("completed", "complete", "active",
+                                     "terminated", "results")):
+        return True
+    if str(row.get("has_results", "")).lower() in ("true", "yes", "1"):
+        return True
+    return False
+
+
+def _build_acronym_search_suffix(rows: List[Dict[str, Any]]) -> str:
+    """Build a Gemini prompt suffix that lists each trial's acronym and
+    NCT ID, instructing Gemini to search specifically by acronym."""
+    lines = []
+    for r in rows:
+        acronym = r.get("trial_acronym", "")
+        tid = r.get("trial_id", "")
+        nct_from_url = _extract_nct_from_url(
+            r.get("source_url", "") or r.get("url", ""))
+        ref_id = tid if _is_ctgov_id(tid) else (nct_from_url or tid)
+        if acronym:
+            lines.append(f"  - {tid}: acronym={acronym}, ref_nct={ref_id}")
+
+    return f"""
+ACRONYM-TARGETED SEARCH MODE — these trials have known program acronyms
+that are highly searchable in press releases, journal publications, and
+conference abstracts. For each trial below, you MUST search using BOTH
+the trial acronym AND the NCT/trial ID:
+
+{chr(10).join(lines)}
+
+REQUIRED SEARCH STRATEGY (do ALL of these for each trial):
+1. Search: "<acronym> results" (e.g. "REDEFINE 1 results")
+2. Search: "<acronym> <molecule> weight loss" OR "<acronym> HbA1c"
+3. Search: "<acronym> topline" OR "<acronym> headline results"
+4. Search: "<acronym> NEJM" OR "<acronym> Lancet" OR "<acronym> published"
+5. Search: "<ref_nct> results" if different from trial_id
+6. Search: "<molecule> <acronym> press release Novo Nordisk"
+
+These searches will find press releases (GlobeNewsWire, BioSpace),
+journal publications (NEJM, Lancet, Diabetes Care), and conference
+abstracts (ADA, EASD, AASLD) that contain exact efficacy numbers.
+The numbers ARE published for these trials — if you return N/A it means
+you didn't search by acronym. DO NOT skip the acronym searches.
+
+IMPORTANT: Report the TREATMENT POLICY ESTIMAND (real-world adherence)
+weight/HbA1c values when available, not the trial product estimand.
+If both are reported, prefer treatment policy estimand values.
+"""
 
 
 def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int,
@@ -882,10 +1081,28 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     rows_by_id = {r["trial_id"]: r for r in rows if r.get("trial_id")}
     ctgov_ids = {tid for tid in rows_by_id if _is_ctgov_id(tid)}
 
+    # --- Acronym resolution: fetch from CT.gov API + title extraction ---
+    # Do this early so acronyms are available for all Gemini passes.
+    # Also resolve acronyms for NCT IDs found in EU trial source_urls.
+    url_nct_ids = set()
+    for row in rows_by_id.values():
+        for uk in ("url", "source_url"):
+            nct_from_url = _extract_nct_from_url(row.get(uk, ""))
+            if nct_from_url:
+                url_nct_ids.add(nct_from_url)
+    all_nct_ids = list(ctgov_ids | url_nct_ids)
+    print(f"  Fetching acronyms for {len(all_nct_ids)} NCT ID(s) from CT.gov API ...",
+          file=sys.stderr)
+    api_acronyms = await _fetch_ctgov_acronyms(all_nct_ids)
+    print(f"  Got {len(api_acronyms)} acronym(s) from CT.gov API", file=sys.stderr)
+    _assign_acronyms(rows_by_id, api_acronyms)
+
+    # Log acronym coverage
+    with_acronym = sum(1 for r in rows_by_id.values() if r.get("trial_acronym"))
+    print(f"  Acronyms assigned: {with_acronym}/{len(rows_by_id)} trial(s)",
+          file=sys.stderr)
+
     # --- Pre-fetch: hit each trial's registry URL to grab page content ---
-    # This runs concurrently and gives Gemini the actual page text so it
-    # can extract efficacy data directly instead of spending a search call
-    # to re-find a page we already have the URL for.
     prefetched = await _prefetch_registry_pages(list(rows_by_id.values()))
 
     # --- Pass 1: normal batching, smaller batch size for research depth ---
@@ -912,8 +1129,6 @@ async def enrich(drug: str, max_records: Optional[int] = None,
                   f"{sample}{more}", file=sys.stderr)
 
     # --- Pass 2: single-trial retry for rows still missing efficacy data ---
-    # Covers both "matched but every efficacy field was N/A" and "no match
-    # at all" — either way, give it one more focused shot before giving up.
     if retry_missing:
         retry_rows = [r for r in rows_by_id.values() if _efficacy_missing(r)]
         if retry_rows:
@@ -932,10 +1147,40 @@ async def enrich(drug: str, max_records: Optional[int] = None,
             print("  Pass 2: skipped — no trials missing efficacy data.", file=sys.stderr)
 
     # --- Pass 3 (no API calls): cross-URL efficacy propagation ---
-    # Many EU CTIS/EudraCT entries share the same source_url as a CT.gov
-    # trial (e.g. both point to the same clinicaltrials.gov/study/NCTxxx
-    # page). If the CT.gov row already has efficacy data but the EU row
-    # doesn't, copy it across. This is free — no Gemini calls needed.
+    _propagate_efficacy_by_url(rows_by_id)
+
+    # --- Pass 4: acronym-targeted Gemini search for COMPLETED trials ---
+    # After propagation, some completed trials may still lack efficacy.
+    # For each one that has an acronym, do a single focused Gemini call
+    # with the acronym explicitly injected into the prompt as the primary
+    # search term.
+    if retry_missing:
+        acronym_retry_rows = [
+            r for r in rows_by_id.values()
+            if (_efficacy_missing(r)
+                and r.get("trial_acronym")
+                and _is_completed_or_has_results(r))
+        ]
+        if acronym_retry_rows:
+            print(f"  Pass 4 (acronym search): {len(acronym_retry_rows)} completed "
+                  f"trial(s) with acronyms still missing efficacy data ...",
+                  file=sys.stderr)
+            acronym_batches = _chunk_by_source(acronym_retry_rows, RETRY_BATCH_SIZE,
+                                                prefetched=prefetched)
+            acronym_enriched = await _run_batches(
+                drug, acronym_batches,
+                extra_suffix=_build_acronym_search_suffix(acronym_retry_rows),
+                label="pass4-acronym")
+            acronym_matched = _merge_enriched(acronym_enriched, rows_by_id)
+            still_missing = sum(1 for r in acronym_retry_rows if _efficacy_missing(r))
+            print(f"  Pass 4: recovered efficacy for "
+                  f"{len(acronym_retry_rows) - still_missing}/{len(acronym_retry_rows)} "
+                  f"trial(s)", file=sys.stderr)
+        else:
+            print("  Pass 4: skipped — no completed+acronym trials missing efficacy.",
+                  file=sys.stderr)
+
+    # --- Final propagation pass after acronym search may have filled donors ---
     _propagate_efficacy_by_url(rows_by_id)
 
     # Cross-check Start/Completion Date against the authoritative CT.gov API
