@@ -1862,6 +1862,20 @@ _PROGRAM_PRESS_RELEASES: Dict[str, List[str]] = {
         "https://www.prnewswire.com/news-releases/novo-nordisks-cagrisema-2-4-mg--2-4-mg-demonstrated-significant-reduction-in-hba1c-and-weight-across-multiple-studies-in-the-reimagine-program-presented-at-ada-2026--302793443.html",
         "https://www.managedhealthcareexecutive.com/view/cagrisema-reduces-hba1c-weight-across-t2d-spectrum-in-reimagine-trials-ada-2026",
     ],
+    "REDEFINE 5": [
+        "https://pubmed.ncbi.nlm.nih.gov/42009015/",
+        "https://www.thelancet.com/journals/landia/article/PIIS2213-8587(25)00402-4/abstract",
+    ],
+}
+
+_NCT_TO_PROGRAM: Dict[str, str] = {
+    "NCT06323174": "REIMAGINE 1",
+    "NCT06065540": "REIMAGINE 2",
+    "NCT06323161": "REIMAGINE 3",
+    "NCT05813925": "REDEFINE 5",
+    "NCT05567796": "REDEFINE 1",
+    "NCT05394519": "REDEFINE 2",
+    "NCT06131437": "REDEFINE 4",
 }
 
 _PRESS_RELEASE_FETCH_TIMEOUT = 12
@@ -1896,7 +1910,9 @@ async def _prefetch_press_releases(rows: List[Dict[str, Any]]) -> Dict[str, str]
     known press releases and return {trial_id: combined_text}. Merged into
     the grounding check alongside the CT.gov API text and PubMed abstract.
     """
-    # Build acronym -> [trial_id] mapping
+    # Build acronym -> [trial_id] mapping using title extraction first,
+    # then fall back to the explicit NCT-to-program table for trials whose
+    # CT.gov title is the full protocol name rather than the short label.
     acronym_to_ids: Dict[str, List[str]] = {}
     for row in rows:
         tid = row.get("trial_id", "")
@@ -1905,6 +1921,9 @@ async def _prefetch_press_releases(rows: List[Dict[str, Any]]) -> Dict[str, str]
         title = (row.get("public_title", "") or row.get("title", "")
                  or row.get("brief_title", "") or "")
         acronym = _extract_trial_acronym(title)
+        # If title extraction found nothing useful, try the NCT lookup table
+        if (not acronym or acronym not in _PROGRAM_PRESS_RELEASES) and _is_ctgov_id(tid):
+            acronym = _NCT_TO_PROGRAM.get(tid.upper(), "")
         if acronym and acronym in _PROGRAM_PRESS_RELEASES:
             acronym_to_ids.setdefault(acronym, []).append(tid)
 
@@ -2000,6 +2019,18 @@ def _validate_source_urls(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
     )
     nct_in_url = re.compile(r"NCT\d{8}", re.IGNORECASE)
 
+    # Known-real NEJM DOI suffixes for CagriSema publications.
+    # Gemini sometimes produces plausible-looking but wrong DOI numbers
+    # on the NEJM domain (e.g. NEJMoa2503248 instead of NEJMoa2502082).
+    # We whitelist the real ones; anything else on nejm.org with a
+    # NEJMoa prefix that isn't in this set is cleared.
+    KNOWN_NEJM_DOIS = {
+        "NEJMoa2502081",  # REDEFINE 1 (Garvey et al., Jun 2025)
+        "NEJMoa2502082",  # REDEFINE 2 (Davies et al., Jun 2025)
+        "NEJMoa2414343",  # Not a CagriSema paper — flag if seen
+    }
+    REAL_CAGRISEMA_NEJM_DOIS = {"NEJMoa2502081", "NEJMoa2502082"}
+
     source_url_fields = [
         "hba1c_source_url", "weight_source_url",
         "alt_source_url", "mash_source_url",
@@ -2011,36 +2042,44 @@ def _validate_source_urls(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
             if not url or url.lower() == "n/a":
                 row[field] = ""
                 continue
-            # Must be a real URL
             if not url.startswith(("http://", "https://")):
                 row[field] = ""
                 cleared += 1
                 continue
-            # Must be from a trusted domain
             if not TRUSTED_DOMAINS.match(url):
-                print(f"  [warn] {tid}: {field} points to an untrusted domain, "
+                print(f"  [warn] {tid}: {field} untrusted domain, clearing: {url[:80]}",
+                      file=sys.stderr)
+                row[field] = ""
+                cleared += 1
+                continue
+            if BAD_PATTERNS.search(url):
+                print(f"  [warn] {tid}: {field} known-fabrication pattern, "
                       f"clearing: {url[:80]}", file=sys.stderr)
                 row[field] = ""
                 cleared += 1
                 continue
-            # Must not be a known-bad pattern
-            if BAD_PATTERNS.search(url):
-                print(f"  [warn] {tid}: {field} matches a known-fabrication "
-                      f"pattern, clearing: {url[:80]}", file=sys.stderr)
-                row[field] = ""
-                cleared += 1
-                continue
-            # If the URL contains an NCT ID, it must match this row's own
+            # NEJM-specific: validate the DOI suffix is a real CagriSema paper
+            if "nejm.org" in url.lower():
+                doi_m = re.search(r"(NEJMoa\d{7})", url, re.IGNORECASE)
+                if doi_m and doi_m.group(1).upper() not in {
+                    d.upper() for d in REAL_CAGRISEMA_NEJM_DOIS
+                }:
+                    print(f"  [warn] {tid}: {field} NEJM URL has unrecognised "
+                          f"DOI ({doi_m.group(1)}), clearing: {url[:80]}",
+                          file=sys.stderr)
+                    row[field] = ""
+                    cleared += 1
+                    continue
             nct_m = nct_in_url.search(url)
             if nct_m and _is_ctgov_id(tid) and nct_m.group(0).upper() != tid.upper():
-                print(f"  [warn] {tid}: {field} contains a different trial ID "
+                print(f"  [warn] {tid}: {field} contains different trial ID "
                       f"({nct_m.group(0)}), clearing: {url[:80]}", file=sys.stderr)
                 row[field] = ""
                 cleared += 1
                 continue
     if cleared:
-        print(f"  Cleared {cleared} invalid/fabricated source URL(s) across "
-              f"per-outcome source columns.", file=sys.stderr)
+        print(f"  Cleared {cleared} invalid/fabricated source URL(s).",
+              file=sys.stderr)
 
 
 def _enforce_source_url_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
