@@ -462,6 +462,11 @@ def main() -> int:
                     help="Maximum records per registry (default: all)")
     ap.add_argument("--out", default=None,
                     help="Output Excel file path (default: <molecule>_trials.xlsx)")
+    ap.add_argument("--workers", type=int, default=6,
+                    help="Concurrent trials during outcome enrichment "
+                         "(default: 6; lower this if you hit Gemini rate limits)")
+    ap.add_argument("--no-enrich", action="store_true",
+                    help="Skip the outcome enrichment step entirely")
     args = ap.parse_args()
 
     molecule  = args.molecule.strip()
@@ -477,8 +482,10 @@ def main() -> int:
     print(f"\nTotal trials collected: {len(rows)}", file=sys.stderr)
 
     # ── outcome enrichment (optional, requires GEMINI_API_KEY) ────────────
-    if _enrich is not None:
-        rows = _enrich(rows, molecule)
+    if args.no_enrich:
+        print("[ENRICH] --no-enrich set – skipping.", file=sys.stderr)
+    elif _enrich is not None:
+        rows = _enrich(rows, molecule, max_workers=args.workers)
     else:
         print("[ENRICH] enrich_outcomes.py not importable – skipping.",
               file=sys.stderr)
