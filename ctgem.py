@@ -709,16 +709,16 @@ GEMINI_FIELD_MAP = {
     "Completion Date": "trial_completion_date",
     "HbA1c Change (%)": "hba1c_change_pct",
     "HbA1c Duration": "hba1c_duration",
-    "HbA1c Source URL": "hba1c_source_url",
+    "HbA1c Rationale": "hba1c_rationale",
     "Weight Loss (%)": "weight_change_pct",
     "Weight Duration": "weight_duration",
-    "Weight Source URL": "weight_source_url",
+    "Weight Rationale": "weight_rationale",
     "ALT Reduction (%)": "alt_reduction_pct",
     "ALT Duration": "alt_duration",
-    "ALT Source URL": "alt_source_url",
+    "ALT Rationale": "alt_rationale",
     "MASH Outcome (%)": "mash_resolution_pct",
     "MASH Duration": "mash_duration",
-    "MASH Source URL": "mash_source_url",
+    "MASH Rationale": "mash_rationale",
     "Company": "company_name",
     "Source URL": "source_url",
 }
@@ -740,16 +740,20 @@ FINAL_COLUMNS = [
     "phase_status",
     "hba1c_change_pct",
     "hba1c_duration",
-    "hba1c_source_url",       # URL of publication/release where HbA1c figure was found
+    "hba1c_rationale",
+    "hba1c_confidence",
     "weight_change_pct",
     "weight_duration",
-    "weight_source_url",      # URL of publication/release where weight figure was found
+    "weight_rationale",
+    "weight_confidence",
     "alt_reduction_pct",
     "alt_duration",
-    "alt_source_url",
+    "alt_rationale",
+    "alt_confidence",
     "mash_resolution_pct",
     "mash_duration",
-    "mash_source_url",
+    "mash_rationale",
+    "mash_confidence",
     "company_name",
     "source_url",
     # Per-value audit trail: "registry", "pubmed", or "unverified" per field.
@@ -803,16 +807,20 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
         "phase_status": row.get("phase_status", "") or row.get("status", ""),
         "hba1c_change_pct": row.get("hba1c_change_pct", ""),
         "hba1c_duration": row.get("hba1c_duration", ""),
-        "hba1c_source_url": row.get("hba1c_source_url", ""),
+        "hba1c_rationale": row.get("hba1c_rationale", ""),
+        "hba1c_confidence": row.get("hba1c_confidence", ""),
         "weight_change_pct": row.get("weight_change_pct", ""),
         "weight_duration": row.get("weight_duration", ""),
-        "weight_source_url": row.get("weight_source_url", ""),
+        "weight_rationale": row.get("weight_rationale", ""),
+        "weight_confidence": row.get("weight_confidence", ""),
         "alt_reduction_pct": row.get("alt_reduction_pct", ""),
         "alt_duration": row.get("alt_duration", ""),
-        "alt_source_url": row.get("alt_source_url", ""),
+        "alt_rationale": row.get("alt_rationale", ""),
+        "alt_confidence": row.get("alt_confidence", ""),
         "mash_resolution_pct": row.get("mash_resolution_pct", ""),
         "mash_duration": row.get("mash_duration", ""),
-        "mash_source_url": row.get("mash_source_url", ""),
+        "mash_rationale": row.get("mash_rationale", ""),
+        "mash_confidence": row.get("mash_confidence", ""),
         "company_name": row.get("company_name", "") or row.get("sponsor", ""),
         "source_url": row.get("source_url", "") or row.get("url", ""),
         "efficacy_provenance": row.get("efficacy_provenance", ""),
@@ -1863,33 +1871,22 @@ def _verify_efficacy_grounding(
             else:
                 source = "unverified"
 
-            # Record the confirmed source URL in the per-outcome source
-            # column. Priority: Gemini's own URL (most specific) > press
-            # release URL we fetched > PubMed PMID > CT.gov registry URL.
-            source_url_field = value_field.replace("_change_pct", "_source_url") \
-                                          .replace("_reduction_pct", "_source_url") \
-                                          .replace("_resolution_pct", "_source_url")
-            if not row.get(source_url_field):
-                if source == "press_release" and press_release_prefetched:
-                    # Find which press release URL contained the match
+            # If Gemini didn't supply a rationale, backfill one based on
+            # where we found the number.
+            rationale_field = value_field.replace("_change_pct", "_rationale") \
+                                         .replace("_reduction_pct", "_rationale") \
+                                         .replace("_resolution_pct", "_rationale")
+            if not row.get(rationale_field):
+                if source == "press_release":
                     acronym = _extract_trial_acronym(
                         row.get("public_title", "") or row.get("title", "")
                         or row.get("brief_title", "") or ""
                     )
-                    if acronym and acronym in _PROGRAM_PRESS_RELEASES:
-                        row[source_url_field] = _PROGRAM_PRESS_RELEASES[acronym][0]
+                    row[rationale_field] = f"Confirmed in press release for {acronym or 'this program'}"
                 elif source == "registry":
-                    row[source_url_field] = (
-                        row.get("source_url") or row.get("url") or
-                        (f"https://clinicaltrials.gov/study/{tid}"
-                         if _is_ctgov_id(tid) else "")
-                    )
+                    row[rationale_field] = f"Confirmed in CT.gov API record for {tid}"
                 elif source == "pubmed":
-                    pmid_m = re.search(r"\bPMID[:\s]+(\d+)\b", pubmed_text, re.IGNORECASE)
-                    if pmid_m:
-                        row[source_url_field] = (
-                            f"https://pubmed.ncbi.nlm.nih.gov/{pmid_m.group(1)}/"
-                        )
+                    row[rationale_field] = f"Confirmed in PubMed abstract for {tid}"
 
             counts[source] += 1
             label = value_field.replace("_change_pct", "").replace("_reduction_pct", "") \
@@ -2065,119 +2062,37 @@ async def _prefetch_press_releases(rows: List[Dict[str, Any]]) -> Dict[str, str]
     return result
 
 
-def _validate_source_urls(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
-    """Validate per-outcome source URLs supplied by Gemini.
-
-    The source URL columns (hba1c_source_url, weight_source_url, etc.) are
-    meant to show exactly where each number came from. But Gemini sometimes
-    fabricates these — inventing a plausible-looking URL that doesn't exist
-    or points to the wrong trial. We do three checks:
-
-    1. Basic format: must start with http(s)://. Anything else is cleared.
-    2. Must not be a known-fabrication pattern (StreetInsider SEC filings,
-       generic company homepage without a specific news ID, etc.).
-    3. Must not point to a DIFFERENT trial's NCT ID than the row's own.
-
-    We deliberately do NOT make live HTTP requests here (too slow, too
-    fragile for a batch pipeline). Instead we check structural properties
-    that reliably distinguish real Novo Nordisk/PubMed/NEJM/Lancet URLs
-    from invented ones:
-      - Real PubMed URLs: pubmed.ncbi.nlm.nih.gov/NNNNNNNN/
-      - Real NEJM:        nejm.org/doi/...
-      - Real Lancet:      thelancet.com/...
-      - Real Novo Nordisk: novonordisk.com/.../news-details.html?id=NNNNNN
-      - Real GlobeNewswire: globenewswire.com/news-release/YYYY/MM/DD/...
-      - Real PRNewswire:  prnewswire.com/news-releases/...
-      - Real ACC/ADA/etc. medical society: clear pattern, no NCT mismatch
-
-    Anything that doesn't pass is blanked (not flagged — a blank source URL
-    is less confusing than a wrong one).
-    """
-    # Patterns that match known-good source URL formats
-    TRUSTED_DOMAINS = re.compile(
-        r"https?://(www\.)?(pubmed\.ncbi\.nlm\.nih\.gov|pmc\.ncbi\.nlm\.nih\.gov"
-        r"|nejm\.org|thelancet\.com|novonordisk\.com|globenewswire\.com"
-        r"|prnewswire\.com|sec\.gov|biospace\.com|healio\.com|hcplive\.com"
-        r"|managedhealthcareexecutive\.com|endocrinologyadvisor\.com"
-        r"|acc\.org|diabetes\.org|ama-assn\.org|jamanetwork\.com"
-        r"|clinicaltrials\.gov|pharmacally\.com|drugtopics\.com"
-        r"|renalandurologynews\.com|patientcareonline\.com)",
-        re.IGNORECASE,
-    )
-    # Patterns that are known to be fabricated or unhelpful
-    BAD_PATTERNS = re.compile(
-        r"streetinsider\.com"  # commonly fabricated by LLMs for SEC filings
-        r"|investopedia\.com"
-        r"|wikipedia\.org",
-        re.IGNORECASE,
-    )
-    nct_in_url = re.compile(r"NCT\d{8}", re.IGNORECASE)
-
-    # Known-real NEJM DOI suffixes for CagriSema publications.
-    # Gemini sometimes produces plausible-looking but wrong DOI numbers
-    # on the NEJM domain (e.g. NEJMoa2503248 instead of NEJMoa2502082).
-    # We whitelist the real ones; anything else on nejm.org with a
-    # NEJMoa prefix that isn't in this set is cleared.
-    KNOWN_NEJM_DOIS = {
-        "NEJMoa2502081",  # REDEFINE 1 (Garvey et al., Jun 2025)
-        "NEJMoa2502082",  # REDEFINE 2 (Davies et al., Jun 2025)
-        "NEJMoa2414343",  # Not a CagriSema paper — flag if seen
-    }
-    REAL_CAGRISEMA_NEJM_DOIS = {"NEJMoa2502081", "NEJMoa2502082"}
-
-    source_url_fields = [
-        "hba1c_source_url", "weight_source_url",
-        "alt_source_url", "mash_source_url",
+def _validate_rationales(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Clean up rationale fields — strip N/A from non-empty values, and
+    clear any rationale that is just a bare URL (Gemini sometimes puts a
+    URL instead of a real explanation)."""
+    cleaned = 0
+    rationale_fields = [
+        ("hba1c_change_pct", "hba1c_rationale"),
+        ("weight_change_pct", "weight_rationale"),
+        ("alt_reduction_pct", "alt_rationale"),
+        ("mash_resolution_pct", "mash_rationale"),
     ]
-    cleared = 0
     for tid, row in rows_by_id.items():
-        for field in source_url_fields:
-            url = str(row.get(field, "") or "").strip()
-            if not url or url.lower() == "n/a":
-                row[field] = ""
-                continue
-            if not url.startswith(("http://", "https://")):
-                row[field] = ""
-                cleared += 1
-                continue
-            if not TRUSTED_DOMAINS.match(url):
-                print(f"  [warn] {tid}: {field} untrusted domain, clearing: {url[:80]}",
-                      file=sys.stderr)
-                row[field] = ""
-                cleared += 1
-                continue
-            if BAD_PATTERNS.search(url):
-                print(f"  [warn] {tid}: {field} known-fabrication pattern, "
-                      f"clearing: {url[:80]}", file=sys.stderr)
-                row[field] = ""
-                cleared += 1
-                continue
-            # NEJM-specific: validate the DOI suffix is a real CagriSema paper
-            if "nejm.org" in url.lower():
-                doi_m = re.search(r"(NEJMoa\d{7})", url, re.IGNORECASE)
-                if doi_m and doi_m.group(1).upper() not in {
-                    d.upper() for d in REAL_CAGRISEMA_NEJM_DOIS
-                }:
-                    print(f"  [warn] {tid}: {field} NEJM URL has unrecognised "
-                          f"DOI ({doi_m.group(1)}), clearing: {url[:80]}",
-                          file=sys.stderr)
-                    row[field] = ""
-                    cleared += 1
-                    continue
-            nct_m = nct_in_url.search(url)
-            if nct_m and _is_ctgov_id(tid) and nct_m.group(0).upper() != tid.upper():
-                print(f"  [warn] {tid}: {field} contains different trial ID "
-                      f"({nct_m.group(0)}), clearing: {url[:80]}", file=sys.stderr)
-                row[field] = ""
-                cleared += 1
-                continue
-    if cleared:
-        print(f"  Cleared {cleared} invalid/fabricated source URL(s).",
-              file=sys.stderr)
+        for val_field, rat_field in rationale_fields:
+            val = str(row.get(val_field, "")).strip()
+            rat = str(row.get(rat_field, "") or "").strip()
+            if not val and rat and rat.lower() != "n/a":
+                row[rat_field] = ""
+                cleaned += 1
+            if rat.lower() == "n/a":
+                row[rat_field] = ""
+            # Bare URL is not a rationale
+            if rat.startswith(("http://", "https://")) and " " not in rat:
+                row[rat_field] = ""
+                cleaned += 1
+    if cleaned:
+        print(f"  Cleaned {cleaned} rationale field(s).", file=sys.stderr)
 
 
-def _enforce_source_url_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
-    """Blank any efficacy value that has no source URL after all passes.
+
+def _enforce_rationale_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Blank any efficacy value that has no rationale AND no confirmed provenance.
 
     A missing source URL means Gemini found a number but has no evidence
     trail for it — which is the defining characteristic of every confirmed
@@ -2211,10 +2126,10 @@ def _enforce_source_url_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> No
             if not val:
                 continue
             label = field_to_label.get(value_field, "")
-            source_url_field = value_field.replace("_change_pct", "_source_url") \
-                                          .replace("_reduction_pct", "_source_url") \
-                                          .replace("_resolution_pct", "_source_url")
-            has_url = bool(str(row.get(source_url_field, "") or "").strip())
+            rationale_field = value_field.replace("_change_pct", "_rationale") \
+                                          .replace("_reduction_pct", "_rationale") \
+                                          .replace("_resolution_pct", "_rationale")
+            has_rationale = bool(str(row.get(rationale_field, "") or "").strip())
 
             # "gemini_search" means grounding was skipped (no prefetch text
             # available). Trust Gemini's result — don't enforce.
@@ -2223,17 +2138,131 @@ def _enforce_source_url_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> No
                          or f"{label}=press_release" in prov
                          or f"{label}=gemini_search" in prov)
 
-            if not has_url and not confirmed:
+            if not has_rationale and not confirmed:
                 print(f"  [enforce] {tid}: clearing {value_field}={val!r} — "
-                      f"no source URL and not confirmed in any retrieved source",
+                      f"no rationale and not confirmed in any retrieved source",
                       file=sys.stderr)
                 row[value_field] = ""
                 row[duration_field] = ""
                 blanked += 1
 
     if blanked:
-        print(f"  Source URL enforcement: cleared {blanked} ungrounded value(s) "
-              f"with no source URL.", file=sys.stderr)
+        print(f"  Rationale enforcement: cleared {blanked} ungrounded value(s) "
+              f"with no rationale.", file=sys.stderr)
+
+
+
+async def _verify_confidence(rows_by_id: Dict[str, Dict[str, Any]],
+                              drug: str) -> None:
+    """Make separate Gemini calls to verify each extracted efficacy value.
+
+    For each trial with efficacy data, ask Gemini to independently search
+    for and confirm each number. Rates each as HIGH (confirmed in a
+    credible source for THIS trial) or LOW (not found / different number).
+    """
+    rows_to_check = [row for row in rows_by_id.values()
+                     if any(str(row.get(f, "")).strip()
+                            for f, _ in _EFFICACY_FIELD_PAIRS)]
+    if not rows_to_check:
+        print("  Confidence check: no efficacy values to verify.", file=sys.stderr)
+        return
+
+    print(f"  Confidence check: verifying {len(rows_to_check)} trial(s) "
+          f"via separate Gemini calls ...", file=sys.stderr)
+
+    field_labels = {
+        "hba1c_change_pct": ("HbA1c reduction", "hba1c_duration", "hba1c_rationale", "hba1c_confidence"),
+        "weight_change_pct": ("weight loss", "weight_duration", "weight_rationale", "weight_confidence"),
+        "alt_reduction_pct": ("ALT reduction", "alt_duration", "alt_rationale", "alt_confidence"),
+        "mash_resolution_pct": ("MASH resolution", "mash_duration", "mash_rationale", "mash_confidence"),
+    }
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+
+    async def check_one(row):
+        tid = row.get("trial_id", "?")
+        title = row.get("trial_title", "") or row.get("title", "") or ""
+        claims, field_keys = [], []
+        for val_f, (label, dur_f, rat_f, conf_f) in field_labels.items():
+            val = str(row.get(val_f, "")).strip()
+            if not val:
+                row[conf_f] = ""
+                continue
+            dur = str(row.get(dur_f, "")).strip() or "unknown duration"
+            rat = str(row.get(rat_f, "")).strip() or "no rationale given"
+            claims.append(f"- {label} of {val}% at {dur}. Rationale: \"{rat}\"")
+            field_keys.append(conf_f)
+        if not claims:
+            return
+
+        prompt = f"""You are verifying clinical trial data for accuracy.
+Trial: {tid}
+Title: {title}
+Drug: {drug}
+
+Values extracted by another AI:
+{chr(10).join(claims)}
+
+For EACH value, search for this specific trial's results and respond with ONLY JSON:
+{{ {', '.join(f'"{k}": "HIGH or LOW"' for k in field_keys)} }}
+
+HIGH = you found the same number (within rounding) in a credible source for THIS trial.
+LOW = could not confirm, found a different number, or no results published for this trial.
+Do NOT rate HIGH just because the number is plausible — it must be confirmed for THIS trial."""
+
+        async with semaphore:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_call_gemini_for_confidence, prompt), timeout=30)
+                if isinstance(result, dict):
+                    for cf in field_keys:
+                        v = str(result.get(cf, "")).strip().upper()
+                        row[cf] = v if v in ("HIGH", "LOW") else "LOW"
+                else:
+                    for cf in field_keys:
+                        row[cf] = "LOW"
+            except Exception as exc:
+                print(f"  [warn] Confidence check failed for {tid}: {type(exc).__name__}", file=sys.stderr)
+                for cf in field_keys:
+                    row[cf] = "UNKNOWN"
+
+    await asyncio.gather(*[check_one(r) for r in rows_to_check])
+    high = sum(1 for r in rows_to_check for cf in ("hba1c_confidence","weight_confidence","alt_confidence","mash_confidence") if r.get(cf) == "HIGH")
+    low = sum(1 for r in rows_to_check for cf in ("hba1c_confidence","weight_confidence","alt_confidence","mash_confidence") if r.get(cf) == "LOW")
+    print(f"  Confidence check: {high} HIGH, {low} LOW.", file=sys.stderr)
+
+
+def _call_gemini_for_confidence(prompt: str) -> dict:
+    """Synchronous Gemini call for confidence checking."""
+    import json as _json
+    from json_repair import repair_json
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=types.Content(role="user", parts=[types.Part.from_text(text=prompt)]),
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            temperature=0.1,
+        ),
+    )
+    raw = ""
+    for part in response.candidates[0].content.parts:
+        if hasattr(part, "text") and part.text:
+            raw += part.text
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+        raw = re.sub(r"\n?```\s*$", "", raw)
+    try:
+        return _json.loads(raw)
+    except _json.JSONDecodeError:
+        try:
+            return _json.loads(repair_json(raw))
+        except Exception:
+            return {}
 
 
 def _block_efficacy_on_non_results_trials(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
@@ -2541,7 +2570,7 @@ async def enrich(drug: str, max_records: Optional[int] = None,
 
     # Validate Gemini-supplied per-outcome source URLs — clear fabricated,
     # untrusted-domain, or wrong-trial URLs before they reach the output.
-    _validate_source_urls(rows_by_id)
+    _validate_rationales(rows_by_id)
 
     # Clear efficacy values on trials whose status means no readout can
     # exist yet (Recruiting, Active, etc.) — handles the contamination
@@ -2552,7 +2581,7 @@ async def enrich(drug: str, max_records: Optional[int] = None,
 
     # Clear any remaining efficacy value that has neither a source URL nor
     # a confirmed provenance tag — these are the residual hallucinations.
-    _enforce_source_url_requirement(rows_by_id)
+    _enforce_rationale_requirement(rows_by_id)
 
     # --- Pass 4 (no API calls): reconcile contradictions between rows that
     # share the same underlying trial but ended up with DIFFERENT efficacy
@@ -2567,6 +2596,12 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # --- Pass 6 (no API calls): fix any source_url that points at a
     # different trial's NCT ID than the row it's attached to.
     _fix_mismatched_source_urls(rows_by_id)
+
+    # --- Pass 7: confidence verification via separate Gemini calls ---
+    # For each trial that still has efficacy values after all enforcement,
+    # make a separate LLM call to independently search for and confirm
+    # the number. Each value gets a confidence rating: HIGH or LOW.
+    await _verify_confidence(rows_by_id, drug)
 
     # Apply authoritative CT.gov status/enrollment/dates — already fetched
     # concurrently with pass 2 above. Propagate to EU duplicate rows too.
