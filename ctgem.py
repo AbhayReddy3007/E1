@@ -151,6 +151,47 @@ def _needs_retry(row: Dict[str, Any]) -> bool:
 # How many registry pages to fetch concurrently.
 PREFETCH_CONCURRENCY = 20  # CT.gov API is high-throughput; raise from 10
 
+# ---------------------------------------------------------------------------
+# Network availability: probe at startup whether external prefetch hosts are
+# reachable. In sandbox environments (e.g. Claude.ai code execution) the
+# egress proxy only allows a small allowlist — clinicaltrials.gov, PubMed,
+# and press-release domains are all blocked (HTTP 403 with "Host not in
+# allowlist"). When reachability is False every prefetch is skipped and the
+# grounding check and source-URL enforcement are disabled: Gemini's own
+# Google-Search-grounded response is the only source we have, so blocking
+# on grounding would erase every correct value it finds.
+# ---------------------------------------------------------------------------
+_PREFETCH_PROBE_URL = "https://clinicaltrials.gov/api/v2/studies?pageSize=1"
+_PREFETCH_PROBE_TIMEOUT = 5
+_NETWORK_AVAILABLE: Optional[bool] = None   # lazily set by _probe_network()
+
+
+async def _probe_network() -> bool:
+    """Return True if external prefetch hosts are reachable, False if blocked.
+    Result is cached in _NETWORK_AVAILABLE after the first call."""
+    global _NETWORK_AVAILABLE
+    if _NETWORK_AVAILABLE is not None:
+        return _NETWORK_AVAILABLE
+    try:
+        timeout = aiohttp.ClientTimeout(total=_PREFETCH_PROBE_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(_PREFETCH_PROBE_URL) as resp:
+                body = await resp.text()
+                # 403 with "not in allowlist" = sandbox egress block
+                if resp.status == 403 and "allowlist" in body.lower():
+                    _NETWORK_AVAILABLE = False
+                else:
+                    _NETWORK_AVAILABLE = (resp.status < 500)
+    except Exception:
+        _NETWORK_AVAILABLE = False
+    if not _NETWORK_AVAILABLE:
+        print("  [info] External prefetch hosts are not reachable (sandbox/egress "
+              "restriction). Skipping CT.gov page, PubMed, and press-release "
+              "prefetches. Grounding check and source-URL enforcement are "
+              "disabled — Gemini's own search results are the sole evidence "
+              "source for this run.", file=sys.stderr)
+    return _NETWORK_AVAILABLE
+
 # Max characters of page text to include per trial — enough for the results
 # section without blowing up the prompt context window.
 PREFETCH_MAX_CHARS = 6000
@@ -361,6 +402,8 @@ async def _fetch_ctgov_authoritative(nct_ids: List[str]) -> Dict[str, Dict[str, 
     """
     if not nct_ids:
         return {}
+    if not await _probe_network():
+        return {}
 
     fields = "NCTId,OverallStatus,EnrollmentCount,StartDateStruct,PrimaryCompletionDateStruct"
 
@@ -415,6 +458,8 @@ async def _prefetch_registry_pages(
     use CT.gov's structured JSON API (reliable, includes results); other
     trials fall back to fetching and text-extracting their registry URL.
     """
+    if not await _probe_network():
+        return {}
     ctgov_ids: List[str] = []
     html_url_map: Dict[str, str] = {}  # trial_id -> url
     for row in rows:
@@ -588,6 +633,8 @@ async def _prefetch_pubmed(rows: List[Dict[str, Any]]) -> Dict[str, str]:
     text}. Best-effort and non-fatal: any trial with no acronym, no PubMed
     hit, or a failed request just gets no entry, same as before this
     prefetch existed."""
+    if not await _probe_network():
+        return {}
     candidates = [r for r in rows if r.get("trial_id")]
     if not candidates:
         return {}
@@ -1744,7 +1791,36 @@ def _verify_efficacy_grounding(
     for trustworthiness: it will also delete genuine press-release-only
     figures. Off by default so the default run stays complete; the
     provenance column tells you which cells to trust either way.
+
+    IMPORTANT: when all three prefetch dicts are empty (network unavailable
+    — e.g. sandbox egress restriction blocks clinicaltrials.gov, PubMed,
+    and press-release domains), this function is a no-op. Every value would
+    be "unverified" by definition with no evidence to check against, so
+    running it would erase ALL correct values Gemini found. Grounding only
+    makes sense when we actually have retrieved text to ground against.
     """
+    # If all three prefetch sources are empty, we have no evidence to check
+    # against. Skip entirely — Gemini's own search is the only source.
+    has_registry = any(prefetched.values())
+    has_pubmed = any(pubmed_prefetched.values())
+    has_press = any((press_release_prefetched or {}).values())
+    if not has_registry and not has_pubmed and not has_press:
+        print("  Grounding check: skipped — no prefetched text available "
+              "(network restricted). Gemini source URLs are the sole evidence.",
+              file=sys.stderr)
+        # Still mark all values as provenance="gemini_search" so the column
+        # is populated and enforcement knows grounding was not run.
+        for row in rows_by_id.values():
+            labels = []
+            for value_field, _ in _EFFICACY_FIELD_PAIRS:
+                val = str(row.get(value_field, "")).strip()
+                if val:
+                    label = value_field.replace("_change_pct", "").replace(
+                        "_reduction_pct", "").replace("_resolution_pct", "")
+                    labels.append(f"{label}=gemini_search")
+            row["efficacy_provenance"] = "; ".join(labels)
+        return
+
     groups = _group_related_trial_ids(rows_by_id)
     group_of = {tid: grp for grp in groups for tid in grp}
 
@@ -1758,6 +1834,20 @@ def _verify_efficacy_grounding(
         press_text = " ".join(
             (press_release_prefetched or {}).get(s, "") or "" for s in sibling_ids
         )
+
+        # Per-trial: if we have no text at all for this specific trial's
+        # sibling group, mark as gemini_search and skip — same rationale as
+        # the global skip above, but scoped to the individual trial.
+        if not registry_text and not pubmed_text and not press_text:
+            labels = []
+            for value_field, _ in _EFFICACY_FIELD_PAIRS:
+                val = str(row.get(value_field, "")).strip()
+                if val:
+                    label = value_field.replace("_change_pct", "").replace(
+                        "_reduction_pct", "").replace("_resolution_pct", "")
+                    labels.append(f"{label}=gemini_search")
+            row["efficacy_provenance"] = "; ".join(labels)
+            continue
 
         provenance: List[str] = []
         for value_field, duration_field in _EFFICACY_FIELD_PAIRS:
@@ -1912,6 +2002,8 @@ async def _prefetch_press_releases(rows: List[Dict[str, Any]]) -> Dict[str, str]
     known press releases and return {trial_id: combined_text}. Merged into
     the grounding check alongside the CT.gov API text and PubMed abstract.
     """
+    if not await _probe_network():
+        return {}
     # Build acronym -> [trial_id] mapping using title extraction first,
     # then fall back to the explicit NCT-to-program table for trials whose
     # CT.gov title is the full protocol name rather than the short label.
@@ -2095,13 +2187,12 @@ def _enforce_source_url_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> No
     empty or fabricated (and already cleared by _validate_source_urls).
 
     Two classes of exceptions are allowed:
-    1. A non-empty efficacy_provenance tag of "registry", "pubmed", or
-       "press_release" means _verify_efficacy_grounding already confirmed
-       the value in a real retrieved source — even though Gemini didn't
-       record a URL, we have evidence it's real, and the grounding check
-       itself backfills the source URL. So these are kept.
-    2. If grounding ran but came back "unverified" AND the source URL is
-       blank, the value is cleared unconditionally.
+    1. A non-empty efficacy_provenance tag of "registry", "pubmed",
+       "press_release", or "gemini_search" means grounding either confirmed
+       the value or was skipped because no prefetch text was available.
+       In both cases the value is kept.
+    2. If grounding ran (prefetch text WAS available) but came back
+       "unverified" AND the source URL is blank, the value is cleared.
 
     This is run AFTER _validate_source_urls so fabricated URLs are already
     gone and after _verify_efficacy_grounding so provenance tags exist.
@@ -2125,10 +2216,12 @@ def _enforce_source_url_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> No
                                           .replace("_resolution_pct", "_source_url")
             has_url = bool(str(row.get(source_url_field, "") or "").strip())
 
-            # Check provenance tag for this specific field
+            # "gemini_search" means grounding was skipped (no prefetch text
+            # available). Trust Gemini's result — don't enforce.
             confirmed = (f"{label}=registry" in prov
                          or f"{label}=pubmed" in prov
-                         or f"{label}=press_release" in prov)
+                         or f"{label}=press_release" in prov
+                         or f"{label}=gemini_search" in prov)
 
             if not has_url and not confirmed:
                 print(f"  [enforce] {tid}: clearing {value_field}={val!r} — "
