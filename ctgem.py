@@ -1340,7 +1340,15 @@ async def _run_batches(drug: str, batches: List[tuple], extra_suffix: str = "",
                   f"{', '.join(ids)} got NO data from this batch and will be "
                   f"picked up by the retry pass if one runs.", file=sys.stderr)
             continue
-        flattened.extend(result)
+        # Guard: result should be a list of dicts, but Gemini can return
+        # malformed responses where strings or other types leak in.
+        for item in result:
+            if isinstance(item, dict):
+                flattened.append(item)
+            else:
+                print(f"  [{label}] [warn] Skipping non-dict item in batch "
+                      f"result: {type(item).__name__}: {str(item)[:80]}",
+                      file=sys.stderr)
 
     if failed_batches:
         print(f"  [{label}] {failed_batches}/{len(batches)} batch(es) failed "
@@ -1375,6 +1383,11 @@ def _merge_enriched(enriched_trials: List[Dict[str, Any]],
     matched_ids = set()
     unmatched_returned = []
     for trial in enriched_trials:
+        # Guard: Gemini sometimes returns bare strings or other non-dict
+        # items in its response (e.g. an error message mixed into the
+        # JSON array). Skip anything that isn't a proper trial dict.
+        if not isinstance(trial, dict):
+            continue
         raw_returned_id = trial.get("Trial ID", "")
         trial_id = _clean_trial_id(raw_returned_id)
         row = rows_by_id.get(trial_id)
