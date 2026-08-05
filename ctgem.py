@@ -149,7 +149,7 @@ def _needs_retry(row: Dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 # How many registry pages to fetch concurrently.
-PREFETCH_CONCURRENCY = 10
+PREFETCH_CONCURRENCY = 20  # CT.gov API is high-throughput; raise from 10
 
 # Max characters of page text to include per trial — enough for the results
 # section without blowing up the prompt context window.
@@ -501,7 +501,9 @@ async def _prefetch_registry_pages(
 # API for wire-service press releases the way there is for PubMed.
 # ---------------------------------------------------------------------------
 
-PUBMED_CONCURRENCY = 3          # NCBI's unauthenticated rate limit is ~3 req/s
+PUBMED_CONCURRENCY = 5          # NCBI allows ~3 req/s unauthenticated; 2 calls per
+                                # trial (esearch + efetch) so 5 concurrent trials
+                                # stays safely under the limit
 PUBMED_TIMEOUT = 15
 PUBMED_MAX_IDS = 3              # top N matching papers to pull abstracts for
 PUBMED_MAX_CHARS = 4000         # keep prompt size reasonable per trial
@@ -1879,7 +1881,7 @@ _NCT_TO_PROGRAM: Dict[str, str] = {
 }
 
 _PRESS_RELEASE_FETCH_TIMEOUT = 12
-_PRESS_RELEASE_CONCURRENCY = 3
+_PRESS_RELEASE_CONCURRENCY = 6   # was 3; these are different hostnames so parallelism is safe
 _PRESS_RELEASE_MAX_CHARS = 5000
 
 
@@ -2333,27 +2335,22 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     rows_by_id = {r["trial_id"]: r for r in rows if r.get("trial_id")}
     ctgov_ids = {tid for tid in rows_by_id if _is_ctgov_id(tid)}
 
-    # --- Pre-fetch: hit each trial's registry URL to grab page content ---
-    # This runs concurrently and gives Gemini the actual page text so it
-    # can extract efficacy data directly instead of spending a search call
-    # to re-find a page we already have the URL for.
-    prefetched = await _prefetch_registry_pages(list(rows_by_id.values()))
-
-    # Run alongside the registry prefetch: a direct, keyless PubMed lookup
-    # per trial (by acronym, falling back to trial ID). This is what closed
-    # the gap found during manual verification — e.g. NCT05813925/REDEFINE 5
-    # has a full Lancet Diabetes & Endocrinology paper indexed on PubMed
-    # that Gemini's own in-context search kept missing. See _prefetch_pubmed
-    # for why this exists as a separate, deterministic step rather than
-    # relying solely on prompting Gemini to search harder.
-    pubmed_prefetched = await _prefetch_pubmed(list(rows_by_id.values()))
-
-    # Also prefetch known sponsor press releases for trials with published
-    # results — these are the primary source for values that are real but
-    # don't appear in CT.gov API text or PubMed abstracts (e.g. REDEFINE 2
-    # HbA1c=1.8 is in a Novo Nordisk/ADA press release, not in the CT.gov
-    # record which only has protocol text).
-    press_release_prefetched = await _prefetch_press_releases(list(rows_by_id.values()))
+    # --- Pre-fetch: three independent I/O passes run concurrently ---
+    # All three have no dependency on each other and all three must finish
+    # before Gemini pass 1 can start, so gathering them saves the sum of
+    # two of their latencies (~15 s each for a 50-trial dataset).
+    #   1. Registry pages  — CT.gov API JSON per NCT ID
+    #   2. PubMed          — NCBI E-utilities abstract per trial acronym/ID
+    #   3. Press releases  — known Novo Nordisk / PRNewswire / GlobeNewswire
+    #                        pages per program acronym (REDEFINE/REIMAGINE)
+    rows_list = list(rows_by_id.values())
+    (prefetched,
+     pubmed_prefetched,
+     press_release_prefetched) = await asyncio.gather(
+        _prefetch_registry_pages(rows_list),
+        _prefetch_pubmed(rows_list),
+        _prefetch_press_releases(rows_list),
+    )
 
     # Detect acronym collisions (e.g. two unrelated trials both informally
     # called "REDEFINE 4" in outside press coverage) so the per-trial prompt
@@ -2392,35 +2389,46 @@ async def enrich(drug: str, max_records: Optional[int] = None,
             print(f"  [warn] {len(ids)} '{src}' trial(s) got no Gemini match at all: "
                   f"{sample}{more}", file=sys.stderr)
 
-    # --- Pass 2: single-trial retry for rows still missing efficacy data ---
-    # Covers both "matched but every efficacy field was N/A" and "no match
-    # at all" — either way, give it one more focused shot before giving up.
-    if retry_missing:
-        # Retry any row missing efficacy data OR a core field that should
-        # normally be recoverable (title, phase, size, location, status,
-        # start date) — not just efficacy, since those aren't the only
-        # required fields that can come back empty.
-        retry_rows = [r for r in rows_by_id.values() if _needs_retry(r)]
-        if retry_rows:
-            efficacy_only = sum(1 for r in retry_rows if _efficacy_missing(r) and not _core_fields_missing(r))
-            core_missing = sum(1 for r in retry_rows if _core_fields_missing(r))
-            print(f"  Pass 2: retrying {len(retry_rows)} trial(s) "
-                  f"({efficacy_only} missing only efficacy data, "
-                  f"{core_missing} missing core fields), "
-                  f"1 trial/call, deep-dive prompt ...", file=sys.stderr)
-            retry_batches = _chunk_by_source(retry_rows, RETRY_BATCH_SIZE,
-                                              prefetched=prefetched,
-                                              acronym_collisions=acronym_collisions,
-                                              pubmed_prefetched=pubmed_prefetched)
-            retry_enriched = await _run_batches(drug, retry_batches,
-                                                 extra_suffix=DEEP_DIVE_SUFFIX, label="pass2")
-            retry_matched = _merge_enriched(retry_enriched, rows_by_id)
-            still_missing = sum(1 for r in retry_rows if _needs_retry(r))
-            print(f"  Pass 2: recovered data for "
-                  f"{len(retry_rows) - still_missing}/{len(retry_rows)} previously-incomplete trial(s)",
-                  file=sys.stderr)
-        else:
+    # --- Pass 2 + authoritative CT.gov fetch (concurrent) ---
+    # Compute retry candidates first (CPU only, instant)
+    retry_rows = [r for r in rows_by_id.values() if _needs_retry(r)] if retry_missing else []
+    #   • Pass 2 only needs prefetched/pubmed/press data (already done).
+    #   • _fetch_ctgov_authoritative only needs the set of NCT IDs.
+    # Running them in parallel shaves ~10–15 s for a 30-trial CT.gov set.
+    if retry_missing and retry_rows:
+        efficacy_only = sum(1 for r in retry_rows if _efficacy_missing(r) and not _core_fields_missing(r))
+        core_missing = sum(1 for r in retry_rows if _core_fields_missing(r))
+        print(f"  Pass 2: retrying {len(retry_rows)} trial(s) "
+              f"({efficacy_only} missing only efficacy data, "
+              f"{core_missing} missing core fields), "
+              f"1 trial/call, deep-dive prompt ... (running concurrently with CT.gov auth fetch)",
+              file=sys.stderr)
+        retry_batches = _chunk_by_source(retry_rows, RETRY_BATCH_SIZE,
+                                          prefetched=prefetched,
+                                          acronym_collisions=acronym_collisions,
+                                          pubmed_prefetched=pubmed_prefetched)
+
+        async def _no_op_auth():
+            return {}
+
+        # Build the authoritative-fetch coroutine (or a no-op if no NCT IDs)
+        auth_coro = (_fetch_ctgov_authoritative(list(ctgov_ids))
+                     if ctgov_ids else _no_op_auth())
+
+        retry_enriched, authoritative = await asyncio.gather(
+            _run_batches(drug, retry_batches, extra_suffix=DEEP_DIVE_SUFFIX, label="pass2"),
+            auth_coro,
+        )
+        retry_matched = _merge_enriched(retry_enriched, rows_by_id)
+        still_missing = sum(1 for r in retry_rows if _needs_retry(r))
+        print(f"  Pass 2: recovered data for "
+              f"{len(retry_rows) - still_missing}/{len(retry_rows)} previously-incomplete trial(s)",
+              file=sys.stderr)
+    else:
+        if retry_missing:
             print("  Pass 2: skipped — no trials missing efficacy or core data.", file=sys.stderr)
+        # Still need the authoritative fetch even if pass 2 is skipped
+        authoritative = await _fetch_ctgov_authoritative(list(ctgov_ids)) if ctgov_ids else {}
 
     # --- Pass 3 (no API calls): cross-URL efficacy propagation ---
     # Many EU CTIS/EudraCT entries share the same source_url as a CT.gov
@@ -2467,17 +2475,9 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # different trial's NCT ID than the row it's attached to.
     _fix_mismatched_source_urls(rows_by_id)
 
-    # Cross-check status, enrollment, and Start/Completion Date against the
-    # authoritative CT.gov API. This ONLY applies to CT.gov-native rows
-    # directly (NCT IDs) — the API has no knowledge of EU CTIS/EudraCT
-    # trial numbers. But an EU row is frequently just a duplicate entry for
-    # the SAME underlying trial (linked via source_url or a secondary NCT
-    # ID) — so once we have the authoritative values for the CT.gov row,
-    # propagate them to any EU row(s) in its group too, rather than leaving
-    # the EU duplicate on a stale/Gemini-guessed status while its own
-    # CT.gov row gets corrected.
-    if ctgov_ids:
-        authoritative = await _fetch_ctgov_authoritative(list(ctgov_ids))
+    # Apply authoritative CT.gov status/enrollment/dates — already fetched
+    # concurrently with pass 2 above. Propagate to EU duplicate rows too.
+    if ctgov_ids and authoritative:
         groups_by_tid = {tid: grp for grp in _group_related_trial_ids(rows_by_id) for tid in grp}
         overridden = 0
         for nct_id, info in authoritative.items():

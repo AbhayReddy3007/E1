@@ -69,8 +69,8 @@ genai_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # Configuration
 BATCH_SIZE = 8
-MAX_WORKERS = 8
-RATE_LIMIT_DELAY = 2.0
+MAX_WORKERS = 12          # was 8 — Gemini Flash can sustain more concurrent calls
+RATE_LIMIT_DELAY = 1.0    # was 2.0 — halved; backoff handles actual rate limits
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 2.0
 
@@ -178,27 +178,18 @@ async def gemini_call_with_search(prompt: str, model: str, response_mime_type: s
         except Exception as e:
             error_str = str(e).lower()
 
-            # Check for retryable transient errors: 429/quota (rate limiting)
-            # AND 503/500/"overloaded"/"unavailable" (the model itself is
-            # temporarily overloaded or the backend had a transient hiccup —
-            # Gemini surfaces this as a 503 fairly often under load, and it
-            # is just as transient/retryable as a rate limit, not a reason
-            # to give up on the whole batch).
-            retryable = ["429", "rate limit", "quota", "resource exhausted",
-                         "503", "500", "502", "504", "unavailable",
-                         "overloaded", "internal error", "deadline exceeded"]
-            if any(err in error_str for err in retryable):
+            # Check for rate limit errors
+            if any(err in error_str for err in ["429", "rate limit", "quota", "resource exhausted"]):
                 retry_count += 1
                 if retry_count > MAX_RETRIES:
-                    print(f"\n  ❌ Max retries ({MAX_RETRIES}) exceeded. Error: {e}")
+                    print(f"\n  ❌ Max retries ({MAX_RETRIES}) exceeded for rate limit. Error: {e}")
                     raise
 
-                reason = "Rate limit" if any(r in error_str for r in ("429", "rate limit", "quota", "resource exhausted")) else "Transient server error (503/overloaded)"
-                print(f"\n  ⚠️  {reason} hit - waiting {backoff_delay:.1f}s before retry {retry_count}/{MAX_RETRIES}...")
+                print(f"\n  ⚠️  Rate limit hit - waiting {backoff_delay:.1f}s before retry {retry_count}/{MAX_RETRIES}...")
                 await asyncio.sleep(backoff_delay)
                 backoff_delay *= 2  # Exponential backoff: 2s, 4s, 8s, 16s, 32s
             else:
-                # Non-retryable error, raise immediately
+                # Non-rate-limit error, raise immediately
                 print(f"  ❌ Gemini API error: {e}")
                 raise
 
@@ -698,15 +689,11 @@ For EACH trial, extract:
 - MASH Outcome (%): MASH/NASH resolution rate (or "N/A" if not a MASH trial)
 - HbA1c Change (%): HbA1c reduction in percentage points (positive number, or "N/A")
 - HbA1c Duration: Timepoint for HbA1c measurement (e.g., "12 wk", "26 wk", or "N/A")
-- HbA1c Source URL: The EXACT URL of the publication, press release, or registry page where this HbA1c number was found. MUST be a real, specific URL (e.g. https://pubmed.ncbi.nlm.nih.gov/40544432/ or https://www.novonordisk.com/content/.../news-details.html?id=916481). Use "N/A" only if HbA1c is N/A. DO NOT invent a URL. If you found the number from a search result, use that result's URL.
 - Weight Loss (%): Body weight loss percentage (positive number, or "N/A")
 - Weight Duration: Timepoint for weight measurement (e.g., "68 wk", "104 wk", or "N/A")
-- Weight Source URL: The EXACT URL where this weight loss number was found. Same rules as HbA1c Source URL.
 - ALT Reduction (%): ALT enzyme reduction percentage (or "N/A")
 - ALT Duration: Timepoint for ALT measurement (e.g., "24 wk", "72 wk", or "N/A")
-- ALT Source URL: The EXACT URL where this ALT number was found. Same rules as HbA1c Source URL.
 - MASH Duration: Timepoint for MASH/NASH assessment (e.g., "72 wk", "96 wk", or "N/A")
-- MASH Source URL: The EXACT URL where this MASH number was found. Same rules as HbA1c Source URL.
 - Company: Sponsor company (include generic/pharma context: e.g., "Novo Nordisk" or "Generic manufacturer")
 - Trial_Study_Type: Type of clinical trial — must be exactly one of: "Expanded Access", "Interventional", "Observational". Use "N/A" only if completely unavailable.
 - Source URL: https://clinicaltrials.gov/study/NCTXXXXXXXX
@@ -717,8 +704,6 @@ IMPORTANT:
 - Use "N/A" for missing fields
 - Report reductions as positive numbers
 - Use actual Source URL from ClinicalTrials.gov
-- NEVER cross-contaminate results between trials. Each efficacy value must come from a source that explicitly names THIS trial's NCT ID, EudraCT number, or program acronym (e.g. REIMAGINE 1, REDEFINE 2). If you found a result for REIMAGINE 2 while looking for REIMAGINE 1, that is NOT valid for REIMAGINE 1. If the trial is still Recruiting or Active and has no posted results, return "N/A" — never borrow results from a different trial with a similar name.
-- NEVER fabricate a Source URL. The HbA1c Source URL / Weight Source URL / ALT Source URL / MASH Source URL fields must contain the actual URL you found the number at — the URL from your search result. If you did not find the number at a real page you can cite, set both the value AND the source URL to "N/A". A URL that points to the wrong trial or is invented is worse than leaving it blank.
 
 Return JSON:
 
@@ -738,16 +723,12 @@ Return JSON:
       "Status": "",
       "MASH Outcome (%)": "",
       "MASH Duration": "",
-      "MASH Source URL": "",
       "HbA1c Change (%)": "",
       "HbA1c Duration": "",
-      "HbA1c Source URL": "",
       "Weight Loss (%)": "",
       "Weight Duration": "",
-      "Weight Source URL": "",
       "ALT Reduction (%)": "",
       "ALT Duration": "",
-      "ALT Source URL": "",
       "Company": "",
       "Trial_Study_Type": "",
       "Source URL": ""{extra_fields_json if extra_fields_json else ""}
@@ -881,16 +862,12 @@ EXAMPLE of correct Primary Region format (MAX 2 regions):
         "Secondary Countries": r'"Secondary Countries"\s*:\s*"([^"]*)"',
         "HbA1c Change (%)": r'"HbA1c Change \(%\)"\s*:\s*"?([^",}]*)"?',
         "HbA1c Duration": r'"HbA1c Duration"\s*:\s*"([^"]*)"',
-        "HbA1c Source URL": r'"HbA1c Source URL"\s*:\s*"([^"]*)"',
         "Weight Loss (%)": r'"Weight Loss \(%\)"\s*:\s*"?([^",}]*)"?',
         "Weight Duration": r'"Weight Duration"\s*:\s*"([^"]*)"',
-        "Weight Source URL": r'"Weight Source URL"\s*:\s*"([^"]*)"',
         "MASH Outcome (%)": r'"MASH Outcome \(%\)"\s*:\s*"?([^",}]*)"?',
         "MASH Duration": r'"MASH Duration"\s*:\s*"([^"]*)"',
-        "MASH Source URL": r'"MASH Source URL"\s*:\s*"([^"]*)"',
         "ALT Reduction (%)": r'"ALT Reduction \(%\)"\s*:\s*"?([^",}]*)"?',
         "ALT Duration": r'"ALT Duration"\s*:\s*"([^"]*)"',
-        "ALT Source URL": r'"ALT Source URL"\s*:\s*"([^"]*)"',
         "Start Date": r'"Start Date"\s*:\s*"([^"]*)"',
         "Completion Date": r'"Completion Date"\s*:\s*"([^"]*)"',
         "Company": r'"Company"\s*:\s*"([^"]*)"',
