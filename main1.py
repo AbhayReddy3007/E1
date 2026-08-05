@@ -451,6 +451,59 @@ def write_excel(rows: List[Dict[str, str]], path: str) -> None:
     print(f"\nWrote {len(rows)} trial(s) → {path}", file=sys.stderr)
 
 
+# ── top-N ranking ─────────────────────────────────────────────────────────────
+
+def _rank_and_trim(rows: List[Dict[str, str]], top_n: int) -> List[Dict[str, str]]:
+    """
+    Score each trial by data completeness and return the top N.
+
+    Scoring favours trials that have:
+      - a recognised phase (Phase 3 > Phase 2 > Phase 1 > other)
+      - an enrollment number (larger is better, capped)
+      - start and completion dates
+      - an acronym (published trials almost always have one)
+      - a company name
+    """
+
+    def _phase_score(phase: str) -> int:
+        p = (phase or "").lower()
+        if "3" in p or "iii" in p:
+            return 40
+        if "4" in p or "iv" in p:
+            return 35
+        if "2" in p or "ii" in p:
+            return 30
+        if "1" in p or "i" in p:
+            return 15
+        return 0
+
+    def _enrollment_score(size: str) -> int:
+        try:
+            n = int(str(size).replace(",", "").strip())
+            return min(30, n // 10)           # up to 30 pts
+        except (ValueError, TypeError):
+            return 0
+
+    def _score(row: Dict[str, str]) -> int:
+        s = 0
+        s += _phase_score(row.get("phase", ""))
+        s += _enrollment_score(row.get("trial_size", ""))
+        if row.get("trial_start_date"):
+            s += 5
+        if row.get("trial_completion_date"):
+            s += 5
+        if row.get("acronym"):
+            s += 10
+        if row.get("company_name"):
+            s += 5
+        if row.get("phase_status", "").lower() in ("completed", "active, not recruiting"):
+            s += 10
+        return s
+
+    scored = sorted(rows, key=_score, reverse=True)
+    return scored[:top_n]
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -467,6 +520,10 @@ def main() -> int:
                          "(default: 6; lower this if you hit Gemini rate limits)")
     ap.add_argument("--no-enrich", action="store_true",
                     help="Skip the outcome enrichment step entirely")
+    ap.add_argument("--top-n", type=int, default=None,
+                    help="Only keep the top N trials (by completeness: "
+                         "phase, enrollment, dates). Applied before enrichment "
+                         "so enrichment runs only on the trials you want.")
     args = ap.parse_args()
 
     molecule  = args.molecule.strip()
@@ -480,6 +537,12 @@ def main() -> int:
         return 1
 
     print(f"\nTotal trials collected: {len(rows)}", file=sys.stderr)
+
+    # ── top-N filtering (before enrichment to save API calls) ─────────────
+    if args.top_n and args.top_n > 0 and len(rows) > args.top_n:
+        rows = _rank_and_trim(rows, args.top_n)
+        print(f"Trimmed to top {args.top_n} trial(s) by completeness.",
+              file=sys.stderr)
 
     # ── outcome enrichment (optional, requires GEMINI_API_KEY) ────────────
     if args.no_enrich:

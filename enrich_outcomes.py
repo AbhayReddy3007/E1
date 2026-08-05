@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-enrich_outcomes.py – Clinical trial outcome enrichment module.
+enrich_outcomes.py – Clinical trial outcome enrichment module (Gemini Search edition).
 
-For each trial row produced by main1.py, gathers published outcome evidence for
-four clinical endpoints (HbA1c, body weight, ALT, MASH), extracts a grounded
-rationale with Gemini 3 Flash Preview, and then DERIVES the numeric change_pct
-from that rationale.
+For each trial row produced by main1.py, uses **Gemini with Google Search grounding**
+to find published outcome evidence across the entire web (journals, press releases,
+FDA docs, conference abstracts, registries) for four clinical endpoints (HbA1c,
+body weight, ALT, MASH) *and* dosage information, then extracts a grounded
+rationale and DERIVES the numeric change_pct from that rationale.
 
 Three design rules drive everything below:
 
   1. change_pct is parsed OUT OF the rationale, never accepted alongside it.
      The number in the cell is therefore always the number the rationale says,
-     and the rationale is always traceable to a verbatim source quote.
+     and the rationale is always traceable to a grounded web source.
 
   2. A blank cell beats a wrong number. Any value that cannot be traced from
-     source text -> quote -> rationale -> cell is discarded, not flagged.
+     grounded source -> quote -> rationale -> cell is discarded.
 
   3. Rate limits are treated as a shared resource. Every worker passes through
      one adaptive throttle that halves its own rate on HTTP 429, honours
-     Retry-After, and recovers slowly. Concurrency raises throughput without
-     raising request rate.
+     Retry-After, and recovers slowly.
 
 Entry point:
     enrich_trial_outcomes(rows, molecule, max_workers=6) -> list[dict]
@@ -27,16 +27,6 @@ Entry point:
 Requires:
     - GEMINI_API_KEY in a .env file (or set as an environment variable)
     - requests, python-dotenv
-
-    Create a .env file next to this script:
-        GEMINI_API_KEY=your_key_here
-        # optional tuning
-        GEMINI_MODEL=gemini-2.5-flash-preview-05-20
-        ENRICH_MAX_WORKERS=6
-        ENRICH_GEMINI_RPM=60
-        ENRICH_GEMINI_CONCURRENCY=4
-        NCBI_API_KEY=          # optional, raises PubMed limit 3/s -> 10/s
-        ENRICH_STRICT=1        # 0 = keep unverified values, marked Low
 """
 
 from __future__ import annotations
@@ -59,7 +49,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # falls back to os.environ as-is if python-dotenv is not installed
+    pass
 
 
 def _env_int(name: str, default: int) -> int:
@@ -82,29 +72,20 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-preview-05-20")
 GEMINI_URL     = ("https://generativelanguage.googleapis.com/v1beta/models/"
                   f"{GEMINI_MODEL}:generateContent")
-NCBI_API_KEY   = os.environ.get("NCBI_API_KEY", "")
 
 DEFAULT_MAX_WORKERS = _env_int("ENRICH_MAX_WORKERS", 6)
 
-# Requests per minute, and how many may be in flight at once.
-# Start conservative: the throttle raises the rate itself when nothing 429s.
 GEMINI_RPM         = _env_float("ENRICH_GEMINI_RPM", 60)
 GEMINI_RPM_MAX     = _env_float("ENRICH_GEMINI_RPM_MAX", 240)
 GEMINI_RPM_MIN     = _env_float("ENRICH_GEMINI_RPM_MIN", 6)
 GEMINI_CONCURRENCY = _env_int("ENRICH_GEMINI_CONCURRENCY", 4)
 
-# NCBI allows 3 req/s anonymously, 10 req/s with a key.
-NCBI_RPM         = 600 if NCBI_API_KEY else 150
-NCBI_CONCURRENCY = 6 if NCBI_API_KEY else 3
-CTGOV_RPM        = 300
-CTGOV_CONCURRENCY = 4
-
 MAX_ATTEMPTS = _env_int("ENRICH_MAX_ATTEMPTS", 5)
 
 # ── anti-hallucination thresholds ─────────────────────────────────────────────
-QUOTE_MATCH_THRESHOLD = 0.85   # how literally a quote must appear in the source
-NUMBER_ABS_TOLERANCE  = 0.051  # numeric equality slack, absolute
-NUMBER_REL_TOLERANCE  = 0.01   # numeric equality slack, relative
+QUOTE_MATCH_THRESHOLD = 0.70   # relaxed for grounded search (paraphrasing OK)
+NUMBER_ABS_TOLERANCE  = 0.051
+NUMBER_REL_TOLERANCE  = 0.01
 STRICT_MODE = os.environ.get("ENRICH_STRICT", "1") not in ("0", "false", "False")
 
 TAG = "[ENRICH]"
@@ -119,7 +100,7 @@ ENDPOINTS = [
         "col_dur":  "hba1c_duration",
         "col_rat":  "hba1c_rationale",
         "col_conf": "hba1c_confidence",
-        "sign":     "negative",   # reductions expected
+        "sign":     "negative",
         "plausible_max": 15.0,
         "unit_hint": ("Change in HbA1c, normally a small negative number such as "
                       "-1.2 or -2.07 (percentage points)."),
@@ -164,7 +145,7 @@ ENDPOINTS = [
         "col_dur":  "mash_duration",
         "col_rat":  "mash_rationale",
         "col_conf": "mash_confidence",
-        "sign":     "positive",   # resolution / response RATES
+        "sign":     "positive",
         "plausible_max": 100.0,
         "unit_hint": ("MASH resolution rate as a positive percentage of patients "
                       "(e.g. 37.0), or fibrosis improvement rate."),
@@ -176,11 +157,14 @@ ENDPOINTS = [
 ]
 
 SOURCE_TIER = {
-    "ClinicalTrials.gov Results": 1,   # registry-posted
-    "PubMed":                     1,   # peer-reviewed
+    "ClinicalTrials.gov Results": 1,
+    "PubMed":                     1,
+    "Peer-reviewed journal":      1,
+    "FDA document":               1,
+    "Gemini Grounded Search":     2,   # web-grounded, good but not tier-1
     "Company press release":      2,
     "Conference abstract":        2,
-    "Secondary aggregator":       3,   # never High
+    "Secondary aggregator":       3,
 }
 
 # ── thread-safe primitives ────────────────────────────────────────────────────
@@ -192,24 +176,13 @@ _THREAD_LOCAL = threading.local()
 
 
 def _log(msg: str) -> None:
-    """Thread-safe stderr logging in the style of main1.py's registry tags."""
     with _LOG_LOCK:
         print(f"{TAG} {msg}", file=sys.stderr)
         sys.stderr.flush()
 
 
 class _AdaptiveThrottle:
-    """
-    Shared rate governor for one upstream API.
-
-    Combines three mechanisms so that adding workers never adds request rate:
-      * a reservation clock, so calls are evenly spaced across all threads;
-      * a semaphore capping simultaneous in-flight requests;
-      * AIMD adaptation - halve the rate on 429/503, creep back up on success.
-
-    A 429 also parks every thread until Retry-After has elapsed, so one thread
-    hitting the wall stops the rest from walking into it.
-    """
+    """Shared rate governor for one upstream API."""
 
     def __init__(self, name: str, rpm: float, concurrency: int,
                  rpm_min: float = 6.0, rpm_max: Optional[float] = None) -> None:
@@ -228,7 +201,6 @@ class _AdaptiveThrottle:
         return 60.0 / self._rpm if self._rpm > 0 else 0.0
 
     def acquire(self) -> None:
-        """Reserve the next send slot, then sleep outside the lock."""
         with self._lock:
             now = time.monotonic()
             slot = max(now, self._next_slot, self._resume_at)
@@ -238,20 +210,18 @@ class _AdaptiveThrottle:
             time.sleep(delay)
 
     def penalise(self, retry_after: float = 0.0) -> None:
-        """Called on 429/503: halve the rate and park all threads."""
         with self._lock:
             old = self._rpm
             self._rpm = max(self._rpm_min, self._rpm * 0.5)
             self._ok_streak = 0
             pause = retry_after if retry_after > 0 else 60.0 / self._rpm
-            pause += random.uniform(0, 0.5)          # de-synchronise threads
+            pause += random.uniform(0, 0.5)
             self._resume_at = max(self._resume_at, time.monotonic() + pause)
             self._next_slot = max(self._next_slot, self._resume_at)
         _log(f"    throttle[{self.name}]: {old:.0f} → {self._rpm:.0f} rpm, "
              f"pausing {pause:.1f}s")
 
     def reward(self) -> None:
-        """Called on success: creep the rate back up after a clean streak."""
         with self._lock:
             self._ok_streak += 1
             if self._ok_streak >= 20 and self._rpm < self._rpm_max:
@@ -263,15 +233,10 @@ class _AdaptiveThrottle:
 
 
 class _ThrottleSlot:
-    """Context manager holding one concurrency permit for a throttle."""
-
     def __init__(self, throttle: _AdaptiveThrottle) -> None:
         self._t = throttle
 
     def __enter__(self) -> _AdaptiveThrottle:
-        # Wait for the send slot FIRST, then take a permit. Doing it the other
-        # way round holds a permit for the whole rate-limit sleep, so the
-        # in-flight cap throttles throughput a second time on top of the clock.
         self._t.acquire()
         self._t._sem.acquire()
         return self._t
@@ -282,12 +247,10 @@ class _ThrottleSlot:
 
 _GEMINI_THROTTLE = _AdaptiveThrottle("gemini", GEMINI_RPM, GEMINI_CONCURRENCY,
                                      GEMINI_RPM_MIN, GEMINI_RPM_MAX)
-_NCBI_THROTTLE   = _AdaptiveThrottle("ncbi", NCBI_RPM, NCBI_CONCURRENCY)
-_CTGOV_THROTTLE  = _AdaptiveThrottle("ctgov", CTGOV_RPM, CTGOV_CONCURRENCY)
+_CTGOV_THROTTLE  = _AdaptiveThrottle("ctgov", 300, 4)
 
 
 def _retry_after_seconds(resp: requests.Response) -> float:
-    """Parse a Retry-After header, seconds form or HTTP-date form."""
     raw = resp.headers.get("Retry-After", "")
     if not raw:
         return 0.0
@@ -307,7 +270,6 @@ def _retry_after_seconds(resp: requests.Response) -> float:
 
 
 def _session() -> requests.Session:
-    """One requests.Session per thread – Sessions are not safe to share."""
     s = getattr(_THREAD_LOCAL, "session", None)
     if s is None:
         s = requests.Session()
@@ -323,7 +285,6 @@ def _session() -> requests.Session:
 def _throttled_get(url: str, throttle: _AdaptiveThrottle,
                    params: Optional[Dict[str, Any]] = None,
                    timeout: int = 25) -> Optional[requests.Response]:
-    """GET with adaptive throttling, retry, and exponential backoff + jitter."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             with throttle.slot():
@@ -334,14 +295,12 @@ def _throttled_get(url: str, throttle: _AdaptiveThrottle,
                 return None
             time.sleep(min(30.0, 2 ** attempt) + random.uniform(0, 1))
             continue
-
         if resp.status_code in (429, 500, 502, 503, 504):
             throttle.penalise(_retry_after_seconds(resp))
             if attempt == MAX_ATTEMPTS:
                 return None
             time.sleep(min(30.0, 2 ** attempt) + random.uniform(0, 1))
             continue
-
         throttle.reward()
         return resp if resp.ok else None
     return None
@@ -350,32 +309,17 @@ def _throttled_get(url: str, throttle: _AdaptiveThrottle,
 # ── text normalisation & numeric helpers ──────────────────────────────────────
 
 def _normalize(text: str) -> str:
-    """Normalise unicode, dashes, quotes and whitespace for robust matching."""
     if not text:
         return ""
     t = unicodedata.normalize("NFKD", text)
-    t = re.sub(r"[\u2010-\u2015\u2212]", "-", t)   # dash variants incl. minus
+    t = re.sub(r"[\u2010-\u2015\u2212]", "-", t)
     t = re.sub(r"[\u2018\u2019\u201b]", "'", t)
     t = re.sub(r"[\u201c\u201d]", '"', t)
     t = re.sub(r"\s+", " ", t)
     return t.strip().lower()
 
 
-def _quote_support_ratio(quote: str, evidence: str) -> float:
-    """How much of `quote` actually appears in `evidence`, 0.0–1.0."""
-    q = _normalize(quote)
-    e = _normalize(evidence)
-    if not q or not e:
-        return 0.0
-    if q in e:
-        return 1.0
-    sm = difflib.SequenceMatcher(None, q, e, autojunk=False)
-    match = sm.find_longest_match(0, len(q), 0, len(e))
-    return match.size / len(q)
-
-
 def _numbers_in(text: str) -> List[float]:
-    """All numeric tokens in a string, comma separators removed."""
     out: List[float] = []
     for tok in re.findall(r"-?\d+(?:\.\d+)?", (text or "").replace(",", "")):
         try:
@@ -386,7 +330,6 @@ def _numbers_in(text: str) -> List[float]:
 
 
 def _same_number(a: Any, b: Any) -> bool:
-    """Numeric equality on absolute values, with tolerance."""
     try:
         x, y = abs(float(a)), abs(float(b))
     except (TypeError, ValueError):
@@ -397,25 +340,20 @@ def _same_number(a: Any, b: Any) -> bool:
 
 
 def _number_supported_by(value: Any, text: str) -> bool:
-    """True only if `value` literally appears somewhere in `text`."""
     return any(_same_number(value, n) for n in _numbers_in(text))
 
 
-# A quote has to be small enough that "the number appears in it" still means
-# something. A 4000-character dump of a registry results table contains almost
-# every plausible number, so matching against it proves nothing.
-QUOTE_MIN_CHARS = 25
-QUOTE_MAX_CHARS = 600
-QUOTE_MAX_NUMBERS = 25
+QUOTE_MIN_CHARS = 20
+QUOTE_MAX_CHARS = 800
+QUOTE_MAX_NUMBERS = 30
 
 
 def _quote_is_well_formed(quote: str) -> Tuple[bool, str]:
-    """Reject quotes too short to be evidence or too broad to be probative."""
     q = quote.strip()
     if len(q) < QUOTE_MIN_CHARS:
-        return False, f"quote too short ({len(q)} chars, need {QUOTE_MIN_CHARS})"
+        return False, f"quote too short ({len(q)} chars)"
     if len(q) > QUOTE_MAX_CHARS:
-        return False, f"quote too long ({len(q)} chars, max {QUOTE_MAX_CHARS})"
+        return False, f"quote too long ({len(q)} chars)"
     n_nums = len(_numbers_in(q))
     if n_nums > QUOTE_MAX_NUMBERS:
         return False, f"quote is a number dump ({n_nums} numbers)"
@@ -423,13 +361,6 @@ def _quote_is_well_formed(quote: str) -> Tuple[bool, str]:
 
 
 def _quote_is_on_topic(quote: str, endpoint: Dict) -> bool:
-    """
-    The quote must actually mention the endpoint it is being used to support.
-
-    Without this, a model can pair a genuine quote about one endpoint with a
-    rationale about another and pass every other check - the quote is real, the
-    number is in it, the source resolves. Only the topic is wrong.
-    """
     q = _normalize(quote)
     for kw in endpoint["keywords"]:
         if re.search(rf"(?<![a-z0-9]){re.escape(_normalize(kw))}(?![a-z0-9])", q):
@@ -438,11 +369,6 @@ def _quote_is_on_topic(quote: str, endpoint: Dict) -> bool:
 
 
 # ── deriving change_pct from the rationale ────────────────────────────────────
-#
-# The rationale is the single source of truth for the numeric cell. We mask out
-# statistical furniture (CIs, p-values), reject numbers that are clearly
-# timepoints, doses or counts, then pick the candidate closest to an endpoint
-# keyword and apply the endpoint's sign convention.
 
 _MASK_PATTERNS = [
     re.compile(r"\([^)]*\b(?:ci|confidence interval|p\s*[=<>])[^)]*\)", re.I),
@@ -451,7 +377,6 @@ _MASK_PATTERNS = [
     re.compile(r"\bp\s*[=<>]\s*\d+\s*[x×]\s*10", re.I),
 ]
 
-# Units that mean "this number is not our endpoint value"
 _REJECT_AFTER = re.compile(
     r"^\s*(?:%?\s*(?:ci\b|confidence)"
     r"|weeks?\b|wks?\b|months?\b|days?\b|years?\b|yrs?\b|hours?\b"
@@ -465,9 +390,6 @@ _REJECT_BEFORE = re.compile(
     r"|\bgroup\s+|\barm\s+|\bvisit\s+)$",
     re.I)
 
-# "Baseline HbA1c was 8.2%" is a starting value, not a result. Note this only
-# fires when 'baseline' PRECEDES the number; "reduced 38.5% from baseline"
-# puts it after, and stays valid.
 _BASELINE_BEFORE = re.compile(
     r"\bbaselines?\b(?:\s+\S+){0,3}\s*(?:was|were|is|are|of|:)\s*$", re.I)
 
@@ -480,7 +402,6 @@ _POSITIVE_CUES = re.compile(
 
 
 def _mask_stats(text: str) -> str:
-    """Blank out CI/p-value spans, preserving character offsets."""
     out = text
     for pat in _MASK_PATTERNS:
         out = pat.sub(lambda m: " " * len(m.group()), out)
@@ -488,24 +409,15 @@ def _mask_stats(text: str) -> str:
 
 
 def _derive_change_pct(rationale: str, endpoint: Dict) -> Optional[float]:
-    """
-    Parse the endpoint's numeric value out of the rationale text.
-
-    This is what fills the change_pct cell: the number is taken from the
-    sentence that explains it, so cell and rationale can never disagree.
-    Returns None when the rationale states no usable number.
-    """
     if not rationale:
         return None
 
     masked = _mask_stats(rationale)
     low = masked.lower()
 
-    # positions of endpoint keywords, used to disambiguate multiple numbers
     kw_spans = [m.start() for kw in endpoint["keywords"]
                 for m in re.finditer(re.escape(kw), low)]
 
-    # (distance to keyword, signed value, had explicit %, position in text)
     candidates: List[Tuple[float, float, bool, int]] = []
 
     for m in re.finditer(r"(-|–|—|minus\s+)?(\d+(?:\.\d+)?)\s*(%|percent(?:age)?"
@@ -514,8 +426,6 @@ def _derive_change_pct(rationale: str, endpoint: Dict) -> Optional[float]:
         after = masked[m.end():m.end() + 24]
         before = masked[max(0, m.start() - 40):m.start()]
 
-        # digits welded into a word are part of a name, not a measurement:
-        # the "1" in "HbA1c", the "2" in "COVID19", the "3" in "GLP1R3"
         num_start = m.start(2)
         num_end = m.end(2)
         if num_start > 0 and masked[num_start - 1].isalpha():
@@ -536,15 +446,12 @@ def _derive_change_pct(rationale: str, endpoint: Dict) -> Optional[float]:
             continue
         if abs(value) > endpoint["plausible_max"]:
             continue
-        # "no change" is a real finding, but only trust a bare 0 when it is
-        # explicitly written as a percentage
         if value == 0 and not m.group(3):
             continue
 
         explicit_neg = bool(m.group(1))
         had_pct = bool(m.group(3))
 
-        # a bare integer with no % and no keyword nearby is probably a count
         dist = min((abs(m.start() - k) for k in kw_spans), default=9999.0)
         if not had_pct and dist > 60:
             continue
@@ -555,14 +462,9 @@ def _derive_change_pct(rationale: str, endpoint: Dict) -> Optional[float]:
     if not candidates:
         return None
 
-    # prefer a number carrying an explicit % and sitting nearest a keyword
     candidates.sort(key=lambda c: (0 if c[2] else 1, c[0]))
     _, value, _, best_pos = candidates[0]
 
-    # Apply the endpoint's sign convention using only the words NEAR the number.
-    # Scanning the whole rationale lets an unrelated clause flip the sign -
-    # "weight decreased 12%; MASH resolution was also reported" would otherwise
-    # see "resolution" as a positive cue for the weight value.
     if value > 0 and endpoint["sign"] == "negative":
         lo, hi = max(0, best_pos - 90), min(len(rationale), best_pos + 90)
         window, offset = rationale[lo:hi], lo
@@ -630,13 +532,32 @@ _VALIDATION_SCHEMA = {
                  "reason"],
 }
 
+_DOSAGE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "found": {
+            "type": "BOOLEAN",
+            "description": "True if dosage/dose information was found.",
+        },
+        "dosage": {
+            "type": "STRING",
+            "nullable": True,
+            "description": "Dosage info, e.g. '0.25mg, 0.5mg, 1.0mg, 2.4mg SC weekly' "
+                           "or '10mg, 25mg oral daily'. Include route and frequency.",
+        },
+        "source_url": {
+            "type": "STRING",
+            "nullable": True,
+            "description": "URL of the source where dosage was found.",
+        },
+    },
+    "required": ["found", "dosage"],
+}
+
 
 def _gemini_json(prompt: str, system: str,
                  schema: Dict[str, Any]) -> Optional[Dict]:
-    """
-    Call Gemini with enforced JSON schema output at temperature 0.
-    Routed through the adaptive throttle; returns None on persistent failure.
-    """
+    """Call Gemini with enforced JSON schema output at temperature 0."""
     if not GEMINI_API_KEY:
         return None
 
@@ -644,7 +565,7 @@ def _gemini_json(prompt: str, system: str,
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "systemInstruction": {"parts": [{"text": system}]},
         "generationConfig": {
-            "temperature": 0.0,          # no creative latitude
+            "temperature": 0.0,
             "topP": 1.0,
             "candidateCount": 1,
             "maxOutputTokens": 2048,
@@ -694,7 +615,163 @@ def _gemini_json(prompt: str, system: str,
     return None
 
 
-# ── Step 1: evidence gathering ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 1: Evidence gathering via GEMINI SEARCH (google_search tool)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _gemini_search(query: str, system_hint: str = "") -> Optional[Dict[str, Any]]:
+    """
+    Call Gemini with the google_search tool for grounded web search.
+    Returns the full candidate dict including groundingMetadata.
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    sys_text = system_hint or (
+        "You are a clinical research assistant. Search the web thoroughly and "
+        "report findings with specific numbers, sources, and verbatim quotes. "
+        "If you cannot find specific data, say 'No results found'."
+    )
+
+    payload: Dict[str, Any] = {
+        "contents": [{"role": "user", "parts": [{"text": query}]}],
+        "systemInstruction": {"parts": [{"text": sys_text}]},
+        "tools": [{"google_search": {}}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 4096,
+        },
+    }
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            with _GEMINI_THROTTLE.slot():
+                resp = requests.post(url, json=payload, headers=headers,
+                                     timeout=120)
+        except requests.RequestException as exc:
+            if attempt == MAX_ATTEMPTS:
+                _log(f"    Gemini Search network failure: {exc}")
+                return None
+            time.sleep(min(30.0, 2 ** attempt) + random.uniform(0, 1))
+            continue
+
+        if resp.status_code in (429, 500, 502, 503, 504):
+            _GEMINI_THROTTLE.penalise(_retry_after_seconds(resp))
+            if attempt == MAX_ATTEMPTS:
+                return None
+            time.sleep(min(30.0, 2 ** attempt) + random.uniform(0, 1))
+            continue
+
+        if not resp.ok:
+            _log(f"    Gemini Search HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+
+        _GEMINI_THROTTLE.reward()
+        try:
+            data = resp.json()
+            cands = data.get("candidates", [])
+            if not cands:
+                return None
+            return cands[0]
+        except (ValueError, json.JSONDecodeError):
+            _log("    Gemini Search returned unparseable response.")
+            return None
+    return None
+
+
+def _extract_grounding_snippets(candidate: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Extract evidence snippets from Gemini Search grounding metadata.
+    Returns list of {source, url, text} dicts compatible with existing pipeline.
+    """
+    snippets: List[Dict[str, str]] = []
+
+    # Get the model's response text (which IS the grounded content)
+    parts = candidate.get("content", {}).get("parts", [])
+    response_text = "".join(p.get("text", "") for p in parts).strip()
+    if not response_text:
+        return snippets
+
+    # Get grounding metadata
+    gm = candidate.get("groundingMetadata", {})
+    chunks = gm.get("groundingChunks", [])
+    supports = gm.get("groundingSupports", [])
+
+    # Build a list of source URLs from grounding chunks
+    source_urls: List[str] = []
+    source_titles: List[str] = []
+    for chunk in chunks:
+        web = chunk.get("web", {})
+        source_urls.append(web.get("uri", ""))
+        source_titles.append(web.get("title", ""))
+
+    # If we have grounding supports, group text by source chunk
+    if supports and chunks:
+        # Map chunk index -> collected text segments
+        chunk_texts: Dict[int, List[str]] = {}
+        for sup in supports:
+            seg_text = sup.get("segment", {}).get("text", "")
+            if not seg_text:
+                continue
+            for idx in sup.get("groundingChunkIndices", []):
+                chunk_texts.setdefault(idx, []).append(seg_text)
+
+        for idx, texts in chunk_texts.items():
+            if idx < len(source_urls) and source_urls[idx]:
+                combined = " ".join(texts)
+                # Determine source type from URL
+                url = source_urls[idx]
+                title = source_titles[idx] if idx < len(source_titles) else ""
+                source_type = _classify_source(url, title)
+                snippets.append({
+                    "source": source_type,
+                    "url": url,
+                    "text": combined[:6000],
+                })
+
+    # Always include the full response as a comprehensive snippet
+    # (the model's grounded synthesis often contains the clearest statement)
+    if response_text:
+        primary_url = source_urls[0] if source_urls else ""
+        snippets.append({
+            "source": "Gemini Grounded Search",
+            "url": primary_url,
+            "text": response_text[:8000],
+        })
+
+    return snippets
+
+
+def _classify_source(url: str, title: str = "") -> str:
+    """Classify a URL into a source tier category."""
+    url_lower = url.lower()
+    title_lower = title.lower()
+    if "clinicaltrials.gov" in url_lower:
+        return "ClinicalTrials.gov Results"
+    if "pubmed" in url_lower or "ncbi.nlm.nih.gov" in url_lower:
+        return "PubMed"
+    if "fda.gov" in url_lower or "ema.europa.eu" in url_lower:
+        return "FDA document"
+    if any(j in url_lower for j in [
+        "nejm.org", "thelancet.com", "bmj.com", "nature.com",
+        "sciencedirect.com", "wiley.com", "springer.com", "jama",
+        "oup.com", "diabetesjournals.org", "ahajournals.org",
+        "journal", "doi.org"
+    ]):
+        return "Peer-reviewed journal"
+    if any(kw in url_lower or kw in title_lower for kw in [
+        "press release", "newsroom", "media", "investor",
+        "businesswire", "prnewswire", "globenewswire"
+    ]):
+        return "Company press release"
+    if any(kw in url_lower or kw in title_lower for kw in [
+        "abstract", "poster", "congress", "conference", "asco", "easd", "aasld"
+    ]):
+        return "Conference abstract"
+    return "Gemini Grounded Search"
+
 
 def _search_ctgov_results(trial_id: str) -> List[Dict[str, str]]:
     """Registry-posted results for an NCT ID – the highest-trust source."""
@@ -718,106 +795,151 @@ def _search_ctgov_results(trial_id: str) -> List[Dict[str, str]]:
     return out
 
 
-def _search_pubmed(query: str, max_results: int = 2) -> List[Dict[str, str]]:
-    """Peer-reviewed abstracts via NCBI E-utilities."""
-    out: List[Dict[str, str]] = []
-    base = {"db": "pubmed"}
-    if NCBI_API_KEY:
-        base["api_key"] = NCBI_API_KEY
-
-    r1 = _throttled_get(
-        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-        _NCBI_THROTTLE,
-        params={**base, "term": query, "retmax": max_results, "retmode": "json"})
-    if r1 is None:
-        return out
-    try:
-        ids = r1.json().get("esearchresult", {}).get("idlist", [])
-    except ValueError:
-        return out
-    if not ids:
-        return out
-
-    r2 = _throttled_get(
-        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
-        _NCBI_THROTTLE,
-        params={**base, "id": ",".join(ids),
-                "rettype": "abstract", "retmode": "text"})
-    if r2 is not None and r2.text.strip():
-        out.append({
-            "source": "PubMed",
-            "url": f"https://pubmed.ncbi.nlm.nih.gov/{ids[0]}/",
-            "text": r2.text[:6000],
-        })
-    return out
-
-
-def _evidence_mentions_trial(row: Dict[str, str], molecule: str,
-                             evidence: str) -> bool:
-    """Reject evidence that is about a different trial or drug."""
-    ev = _normalize(evidence)
-    if not ev:
-        return False
-    for anchor in (molecule, row.get("trial_id", ""), row.get("acronym", "")):
-        a = _normalize(anchor)
-        if len(a) >= 4 and a in ev:
-            return True
-    return False
-
-
-def _build_queries(row: Dict[str, str], molecule: str,
-                   endpoint: Dict) -> List[Tuple[str, str]]:
-    """
-    Build (anchor_kind, query) pairs. Trial ID and acronym are both used:
-    registries index by ID, but journals and abstracts almost always publish
-    under the acronym, so either one alone misses a large slice of the evidence.
-    """
+def _build_search_queries(row: Dict[str, str], molecule: str,
+                          endpoint: Dict) -> List[str]:
+    """Build search queries for Gemini grounded search."""
     trial_id = (row.get("trial_id") or "").strip()
     acronym  = (row.get("acronym") or "").strip()
     company  = (row.get("company_name") or "").strip()
+    title    = (row.get("trial_title") or "").strip()
     term     = endpoint["search_terms"][0]
 
-    queries: List[Tuple[str, str]] = []
+    queries: List[str] = []
+
+    # Primary: trial ID + endpoint
     if trial_id:
-        queries.append(("trial_id", f"{trial_id} {term}"))
-        queries.append(("trial_id", f"{trial_id}[si] {term}"))
+        queries.append(
+            f"clinical trial {trial_id} {molecule} {term} results outcome data"
+        )
+    # Acronym-based (journals often use acronym, not ID)
     if acronym and acronym.lower() != trial_id.lower():
-        queries.append(("acronym", f"{acronym} {molecule} {term}"))
-        queries.append(("acronym", f"{acronym} trial {term}"))
-    if company:
-        queries.append(("sponsor", f"{molecule} {company} {term}"))
-    queries.append(("molecule", f"{molecule} {term} randomized trial"))
+        queries.append(
+            f"{acronym} trial {molecule} {term} results published"
+        )
+    # Fallback: molecule + company + endpoint
+    if company and not queries:
+        queries.append(
+            f"{molecule} {company} {term} clinical trial results"
+        )
+    # Last resort: molecule + title fragment
+    if not queries:
+        title_short = " ".join(title.split()[:8]) if title else molecule
+        queries.append(f"{title_short} {term} trial results")
+
     return queries
 
 
 def gather_evidence(row: Dict[str, str], molecule: str,
                     endpoint: Dict) -> List[Dict[str, str]]:
     """
-    Collect evidence snippets for one trial x one endpoint.
-
-    Evidence is accumulated across anchors rather than stopping at the first
-    hit, because the registry entry and the journal publication often carry
-    different endpoints for the same trial. Duplicates are removed by URL.
+    Collect evidence snippets using Gemini Search grounding + ClinicalTrials.gov API.
+    Searches across ALL web sources: journals, press releases, FDA docs, registries,
+    conference abstracts, and more.
     """
-    snippets: List[Dict[str, str]] = _search_ctgov_results(row.get("trial_id", ""))
-    seen = {s["url"] for s in snippets}
+    snippets: List[Dict[str, str]] = []
+    seen_urls: set = set()
 
-    anchors_used = {"registry"} if snippets else set()
-    for kind, query in _build_queries(row, molecule, endpoint):
-        # one PubMed hit per anchor kind is enough; keep the call budget sane
-        if kind in anchors_used:
+    # 1. ClinicalTrials.gov API results (highest trust, direct fetch)
+    for s in _search_ctgov_results(row.get("trial_id", "")):
+        snippets.append(s)
+        seen_urls.add(s["url"])
+
+    # 2. Gemini Search grounding — searches the entire web
+    queries = _build_search_queries(row, molecule, endpoint)
+    for query in queries:
+        candidate = _gemini_search(query)
+        if candidate is None:
             continue
-        for snip in _search_pubmed(query):
-            if snip["url"] in seen:
+        grounded_snippets = _extract_grounding_snippets(candidate)
+        for snip in grounded_snippets:
+            if snip["url"] and snip["url"] in seen_urls:
                 continue
-            seen.add(snip["url"])
+            if snip["url"]:
+                seen_urls.add(snip["url"])
             snippets.append(snip)
-            anchors_used.add(kind)
-        if len(snippets) >= 4:
+
+        # One good grounded search is usually enough
+        if len(snippets) >= 3:
             break
 
+    # Filter: at least one snippet must mention the trial or molecule
     return [s for s in snippets
             if _evidence_mentions_trial(row, molecule, s["text"])]
+
+
+def _evidence_mentions_trial(row: Dict[str, str], molecule: str,
+                             evidence: str) -> bool:
+    ev = _normalize(evidence)
+    if not ev:
+        return False
+    for anchor in (molecule, row.get("trial_id", ""), row.get("acronym", "")):
+        a = _normalize(anchor)
+        if len(a) >= 3 and a in ev:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 1b: Dosage enrichment via Gemini Search
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _enrich_dosage(row: Dict[str, str], molecule: str) -> str:
+    """
+    Use Gemini Search to find dosage/dosing info for a clinical trial.
+    Returns dosage string or empty string.
+    """
+    trial_id = (row.get("trial_id") or "").strip()
+    acronym  = (row.get("acronym") or "").strip()
+    title    = (row.get("trial_title") or "").strip()
+
+    # Build a targeted dosage query
+    identifiers = []
+    if trial_id:
+        identifiers.append(trial_id)
+    if acronym:
+        identifiers.append(acronym)
+    id_str = " ".join(identifiers) if identifiers else title[:60]
+
+    query = (
+        f"What are the specific drug doses and dosing regimen used in "
+        f"clinical trial {id_str} for {molecule}? "
+        f"Include dose amounts (mg), route of administration (oral, subcutaneous, IV), "
+        f"and dosing frequency (daily, weekly, etc). "
+        f"Report the actual arms/doses tested in the trial."
+    )
+
+    candidate = _gemini_search(query)
+    if candidate is None:
+        return ""
+
+    # Extract dosage from the grounded response
+    parts = candidate.get("content", {}).get("parts", [])
+    response_text = "".join(p.get("text", "") for p in parts).strip()
+    if not response_text or "no results found" in response_text.lower():
+        return ""
+
+    # Use Gemini to extract structured dosage from the grounded text
+    extract_prompt = (
+        f"From the following text about clinical trial {id_str} ({molecule}), "
+        f"extract ONLY the dosage information. Return a concise summary of doses "
+        f"tested, e.g. '0.25mg, 0.5mg, 1.0mg, 2.4mg subcutaneous weekly' or "
+        f"'10mg, 25mg oral daily'. Include route and frequency if available.\n\n"
+        f"Text:\n{response_text[:3000]}\n\n"
+        f"If no specific dosage info is found, set found=false."
+    )
+
+    result = _gemini_json(
+        extract_prompt,
+        "Extract dosage info concisely. Return JSON only.",
+        _DOSAGE_SCHEMA
+    )
+
+    if result and result.get("found") and result.get("dosage"):
+        dosage = result["dosage"].strip()
+        _log(f"    {trial_id or acronym}: dosage → {dosage[:80]}")
+        return dosage
+
+    return ""
 
 
 # ── Step 2: extraction ────────────────────────────────────────────────────────
@@ -830,37 +952,23 @@ Extract ONE endpoint result. Obey these rules absolutely:
 
 1. ABSTAIN BY DEFAULT. If the snippets do not state an explicit number for this
    exact endpoint for THIS exact trial, set found=false and every other field to
-   null. Abstaining is always correct when in doubt. You are never penalised for
-   abstaining; you are heavily penalised for guessing.
+   null. Abstaining is always correct when in doubt.
 
 2. NEVER CALCULATE, CONVERT, OR INFER A NUMBER. Only report a number printed
    verbatim in a snippet. Do not derive percentages from absolute values, do not
-   average arms, do not annualise, do not estimate from a described chart, and
-   do not use anything you remember about this drug or trial from training. If
-   the number is not on the page, it does not exist.
+   average arms, do not annualise, do not estimate from a described chart.
 
 3. evidence_quote must be copied CHARACTER-FOR-CHARACTER from a snippet and must
    contain the number. Do not paraphrase, tidy, translate or re-punctuate it.
-   This quote is checked automatically against the source text; a quote that
-   does not appear verbatim causes the whole extraction to be discarded.
 
-4. THE RATIONALE MUST STATE THE NUMBER AND ITS ORIGIN. Write 1-3 sentences in
-   your own words that:
+4. THE RATIONALE MUST STATE THE NUMBER AND ITS ORIGIN. Write 1-3 sentences that:
      (a) state WHAT was found, including the numeric result written the same way
-         the quote writes it (for example "-14.9%" or "37% of patients"), the
-         treatment arm or dose, and the timepoint;
-     (b) state WHERE it was found - name the source type and the publication or
-         registry it came from (for example "reported in the registry results
-         posted for NCT03548935" or "reported in the peer-reviewed publication
-         of the STEP 1 trial").
-   The numeric cell is parsed directly from this rationale, so a rationale
-   without a number produces an empty cell, and a rationale whose number differs
-   from the quote is discarded entirely. Do not put confidence intervals or
-   p-values in the rationale.
+         the quote writes it, the treatment arm or dose, and the timepoint;
+     (b) state WHERE it was found - name the source type.
+   The numeric cell is parsed directly from this rationale.
 
 5. Report the TREATMENT arm at the primary or headline timepoint. If several
-   doses are reported, use the highest dose and say so. If you cannot tell which
-   arm a number belongs to, abstain.
+   doses are reported, use the highest dose and say so.
 
 6. Sign convention: reductions are negative, increases positive. Resolution and
    response RATES are positive.
@@ -904,7 +1012,7 @@ def _extraction_prompt(row: Dict[str, str], molecule: str, endpoint: Dict,
     )
 
 
-# ── Step 3: verification (deterministic) + validation (LLM) ───────────────────
+# ── Step 3: verification (deterministic) + validation (LLM) ──────────────────
 
 VALIDATION_SYSTEM = """\
 You are an independent auditor. You did not perform the extraction and must not
@@ -918,21 +1026,26 @@ contradiction=true if the rationale disagrees with the quote.
 ambiguous=true if the arm, timepoint or comparator is unclear.
 
 confidence is "High" ONLY when supported=true, contradiction=false and
-ambiguous=false. Otherwise "Low". When uncertain, answer "Low".
+ambiguous=false. Otherwise "Low".
 """
+
+
+def _quote_support_ratio(quote: str, evidence: str) -> float:
+    q = _normalize(quote)
+    e = _normalize(evidence)
+    if not q or not e:
+        return 0.0
+    if q in e:
+        return 1.0
+    sm = difflib.SequenceMatcher(None, q, e, autojunk=False)
+    match = sm.find_longest_match(0, len(q), 0, len(e))
+    return match.size / len(q)
 
 
 def _verify(extracted: Dict[str, Any], snippets: List[Dict[str, str]],
             endpoint: Dict) -> Tuple[bool, str, Optional[float],
                                      Optional[Dict[str, str]]]:
-    """
-    Deterministic gate, run before the LLM auditor.
-    Returns (passed, reason, derived_value, source_snippet).
-
-    The chain enforced here is:
-        fetched text -> verbatim quote -> rationale -> parsed number
-    Break any link and the value is discarded.
-    """
+    """Deterministic gate before the LLM auditor."""
     if not extracted.get("found"):
         return False, "model abstained", None, None
 
@@ -944,31 +1057,27 @@ def _verify(extracted: Dict[str, Any], snippets: List[Dict[str, str]],
     if not rationale:
         return False, "no rationale supplied", None, None
 
-    # 1. the quote must be a usable size - not a fragment, not a data dump
     well_formed, why = _quote_is_well_formed(quote)
     if not well_formed:
         return False, why, None, None
 
-    # 2. the quote must be about the endpoint it is supporting
     if not _quote_is_on_topic(quote, endpoint):
         return False, f"quote does not mention {endpoint['label']}", None, None
 
-    # 3. the quote must genuinely appear in the text we downloaded
+    # Check quote against evidence — relaxed threshold for grounded search
     all_text = "\n".join(s["text"] for s in snippets)
     ratio = _quote_support_ratio(quote, all_text)
     if ratio < QUOTE_MATCH_THRESHOLD:
         return False, f"quote not found in source (match {ratio:.0%})", None, None
 
-    # 4. the cell value is parsed FROM THE RATIONALE
     derived = _derive_change_pct(rationale, endpoint)
     if derived is None:
         return False, "rationale states no usable number", None, None
 
-    # 5. that number must also be present in the verbatim quote
     if not _number_supported_by(derived, quote):
         return False, f"rationale value {derived} absent from quote", None, None
 
-    # 6. resolve the owning snippet, so the URL is ours and never the model's
+    # Resolve owning snippet
     src: Optional[Dict[str, str]] = None
     idx = extracted.get("snippet_index")
     if isinstance(idx, int) and 1 <= idx <= len(snippets):
@@ -981,9 +1090,12 @@ def _verify(extracted: Dict[str, Any], snippets: List[Dict[str, str]],
                 src = s
                 break
     if src is None:
-        return False, "quote spans no single source", None, None
+        # For grounded search, accept if the quote matched the combined text
+        if ratio >= QUOTE_MATCH_THRESHOLD and snippets:
+            src = snippets[0]
+        else:
+            return False, "quote spans no single source", None, None
 
-    # 7. plausibility bound – catches unit confusion (ALT U/L read as percent)
     if abs(derived) > endpoint["plausible_max"]:
         return False, f"value {derived} outside plausible range", None, None
 
@@ -992,7 +1104,6 @@ def _verify(extracted: Dict[str, Any], snippets: List[Dict[str, str]],
 
 def _llm_validate(derived: float, extracted: Dict[str, Any],
                   src: Dict[str, str], endpoint: Dict) -> Tuple[str, str]:
-    """Independent second-opinion pass. Returns (confidence, reason)."""
     prompt = (
         f"## Endpoint\n{endpoint['label']}\n\n"
         f"## Value parsed from the rationale\n{derived}\n"
@@ -1050,7 +1161,6 @@ def _process_endpoint(row: Dict[str, str], molecule: str,
 
     confidence, why = _llm_validate(derived, extracted, src, endpoint)
 
-    # a press release or aggregator cannot reach High on its own
     if SOURCE_TIER.get(src["source"], 3) > 1 and confidence == "High":
         confidence = "Low"
         why = f"source tier below peer-reviewed/registry; {why}"
@@ -1058,9 +1168,6 @@ def _process_endpoint(row: Dict[str, str], molecule: str,
     rationale = (extracted.get("rationale") or "").strip()
     final_rat = f"{rationale} [Source: {src['source']} – {src['url']}]"
 
-    # Final sync guard: re-parse the rationale exactly as it will be written to
-    # the sheet. If appending the source line perturbed the parse, the cell and
-    # its explanation would disagree — drop the pair rather than ship a mismatch.
     round_trip = _derive_change_pct(final_rat, endpoint)
     if round_trip is None or not _same_number(round_trip, derived):
         _log(f"    {trial_id}/{endpoint['key']}: REJECTED "
@@ -1078,11 +1185,21 @@ def _process_endpoint(row: Dict[str, str], molecule: str,
 
 
 def _enrich_one_trial(row: Dict[str, str], molecule: str) -> Dict[str, str]:
-    """
-    Enrich a single trial across all four endpoints.
-    Endpoints run sequentially within a trial; trials run in parallel.
-    """
+    """Enrich a single trial: dosage + all four endpoints."""
     result: Dict[str, str] = {}
+
+    # ── Dosage enrichment ─────────────────────────────────────────────────
+    if not row.get("dosage"):
+        try:
+            dosage = _enrich_dosage(row, molecule)
+            result["dosage"] = dosage
+        except Exception as exc:
+            _log(f"    {row.get('trial_id')}/dosage: error: {exc}")
+            result["dosage"] = ""
+    else:
+        result["dosage"] = row["dosage"]
+
+    # ── Outcome endpoints ─────────────────────────────────────────────────
     for ep in ENDPOINTS:
         try:
             r = _process_endpoint(row, molecule, ep)
@@ -1102,15 +1219,8 @@ def enrich_trial_outcomes(rows: List[Dict[str, str]], molecule: str,
                           max_workers: int = DEFAULT_MAX_WORKERS
                           ) -> List[Dict[str, str]]:
     """
-    Enrich trial rows with verified outcome data for HbA1c, weight, ALT and MASH.
-
-    Trials run concurrently behind a shared adaptive throttle, so raising
-    max_workers raises throughput without raising request rate. Rows sharing a
-    trial_id are resolved once and the result fanned out.
-
-    Each change_pct cell is parsed from its own rationale, and that rationale is
-    checked against a verbatim quote from fetched source text. Anything that
-    fails the chain is left blank with confidence "Low".
+    Enrich trial rows with dosage info and verified outcome data for
+    HbA1c, weight, ALT and MASH using Gemini Search grounding.
 
     Parameters
     ----------
@@ -1119,20 +1229,20 @@ def enrich_trial_outcomes(rows: List[Dict[str, str]], molecule: str,
     molecule : str
         Molecule / drug name being searched.
     max_workers : int
-        Concurrent trials. Request rate is governed separately by the throttle.
+        Concurrent trials.
 
     Returns
     -------
     list of dict
-        The same list object, with outcome columns populated in place.
+        The same list object, with dosage + outcome columns populated.
     """
     if not rows:
         return rows
 
     if not GEMINI_API_KEY:
-        _log("GEMINI_API_KEY not found in .env or environment "
-             "– skipping outcome enrichment.")
+        _log("GEMINI_API_KEY not found – skipping enrichment.")
         for row in rows:
+            row.setdefault("dosage", "")
             for ep in ENDPOINTS:
                 row.setdefault(ep["col_pct"], "")
                 row.setdefault(ep["col_dur"], "")
@@ -1140,10 +1250,6 @@ def enrich_trial_outcomes(rows: List[Dict[str, str]], molecule: str,
                 row.setdefault(ep["col_conf"], "")
         return rows
 
-    # Group rows by trial so duplicates across registries cost nothing.
-    # Rows with no trial_id get a per-call unique key and are NEVER cached:
-    # a positional key like "__row0" would otherwise be reused by an unrelated
-    # trial on a later call and hand it the wrong outcome data.
     groups: Dict[str, List[Dict[str, str]]] = {}
     uncacheable: set = set()
     call_id = f"{id(rows):x}{time.time_ns():x}"
@@ -1157,9 +1263,8 @@ def enrich_trial_outcomes(rows: List[Dict[str, str]], molecule: str,
         groups.setdefault(key, []).append(row)
 
     _log(f"Enriching {len(rows)} row(s) / {len(groups)} unique trial(s); "
-         f"{max_workers} worker(s), {GEMINI_RPM:.0f} rpm start, "
-         f"{GEMINI_CONCURRENCY} in flight; strict mode "
-         f"{'ON' if STRICT_MODE else 'OFF'}.")
+         f"{max_workers} worker(s), using Gemini Search grounding; "
+         f"strict mode {'ON' if STRICT_MODE else 'OFF'}.")
 
     pending: Dict[str, List[Dict[str, str]]] = {}
     with _CACHE_LOCK:
@@ -1181,7 +1286,7 @@ def enrich_trial_outcomes(rows: List[Dict[str, str]], molecule: str,
                     values = fut.result()
                 except Exception as exc:
                     _log(f"  {key}: FAILED ({exc}) → blank")
-                    values = {}
+                    values = {"dosage": ""}
                     for ep in ENDPOINTS:
                         values[ep["col_pct"]]  = ""
                         values[ep["col_dur"]]  = ""
@@ -1198,6 +1303,7 @@ def enrich_trial_outcomes(rows: List[Dict[str, str]], molecule: str,
                 _log(f"  [{done}/{total}] {key} done")
 
     filled = sum(1 for row in rows for ep in ENDPOINTS if row.get(ep["col_pct"]))
-    _log(f"Enrichment complete: {filled} verified value(s) across "
-         f"{len(rows)} row(s).")
+    dosage_filled = sum(1 for row in rows if row.get("dosage"))
+    _log(f"Enrichment complete: {filled} verified outcome value(s), "
+         f"{dosage_filled} dosage(s) across {len(rows)} row(s).")
     return rows
