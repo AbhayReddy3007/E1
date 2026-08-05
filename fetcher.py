@@ -56,6 +56,13 @@ try:
 except ImportError:
     _HAS_JSON_REPAIR = False
 
+# ── load .env (python-dotenv) ──────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()          # reads .env in cwd (or any parent) into os.environ
+except ImportError:
+    pass                   # dotenv optional; env vars may already be set
+
 # ── constants ──────────────────────────────────────────────────────────────────
 MODEL          = "gemini-2.5-flash"
 MAX_RETRIES    = 5
@@ -85,12 +92,19 @@ ALL_COLUMNS = [
 ]
 
 # ── Gemini client ──────────────────────────────────────────────────────────────
+
+class _NoApiKeyError(RuntimeError):
+    """Raised (not sys.exit) so async threads propagate cleanly."""
+
 def _make_client() -> genai.Client:
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
-        sys.exit(
-            "ERROR: Set GOOGLE_API_KEY (or GEMINI_API_KEY) environment variable.\n"
-            "  export GOOGLE_API_KEY=your_key_here"
+        raise _NoApiKeyError(
+            "No API key found.\n"
+            "  Option 1: add  GEMINI_API_KEY=your_key  to your .env file\n"
+            "  Option 2: set the environment variable before running:\n"
+            "            Windows:  set GEMINI_API_KEY=your_key\n"
+            "            Mac/Linux: export GEMINI_API_KEY=your_key"
         )
     return genai.Client(api_key=api_key)
 
@@ -101,6 +115,15 @@ def get_client() -> genai.Client:
     if _client is None:
         _client = _make_client()
     return _client
+
+
+def _check_api_key_early() -> None:
+    """Call this at startup (before async) so we fail fast with a clean message."""
+    try:
+        get_client()
+    except _NoApiKeyError as exc:
+        print(f"\nERROR: {exc}\n", file=sys.stderr)
+        sys.exit(1)
 
 
 # ── JSON helpers ───────────────────────────────────────────────────────────────
@@ -165,6 +188,8 @@ async def _gemini_call(prompt: str) -> str:
     for attempt in range(MAX_RETRIES + 1):
         try:
             return await asyncio.to_thread(_sync_call, prompt)
+        except _NoApiKeyError:
+            raise   # propagate immediately; caught in main() before async starts
         except Exception as exc:
             err = str(exc).lower()
             if any(k in err for k in ("429", "rate limit", "quota", "resource exhausted")):
@@ -548,6 +573,9 @@ def main() -> int:
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"  FETCHER  –  {molecule}", file=sys.stderr)
     print(f"{'='*60}\n", file=sys.stderr)
+
+    # Validate API key before launching async (gives a clean error message)
+    _check_api_key_early()
 
     # ── optionally run main1.py first ─────────────────────────────────────────
     if args.run_main1:
