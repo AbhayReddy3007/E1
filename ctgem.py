@@ -1711,10 +1711,10 @@ def _verify_efficacy_grounding(
     rows_by_id: Dict[str, Dict[str, Any]],
     prefetched: Dict[str, str],
     pubmed_prefetched: Dict[str, str],
+    press_release_prefetched: Optional[Dict[str, str]] = None,
     strict: bool = False,
 ) -> None:
-    """Check every efficacy number against text we ACTUALLY retrieved, and
-    record where (if anywhere) it was found.
+    """Check every efficacy number against text we ACTUALLY retrieved.
 
     THIS IS THE ONLY CHECK THAT CAN CATCH A CONFIDENT, SELF-CONSISTENT
     HALLUCINATION. Every other pass in this file compares rows against each
@@ -1746,13 +1746,16 @@ def _verify_efficacy_grounding(
     groups = _group_related_trial_ids(rows_by_id)
     group_of = {tid: grp for grp in groups for tid in grp}
 
-    counts = {"registry": 0, "pubmed": 0, "unverified": 0}
+    counts = {"registry": 0, "pubmed": 0, "press_release": 0, "unverified": 0}
     blanked = 0
 
     for tid, row in rows_by_id.items():
         sibling_ids = group_of.get(tid, [tid])
         registry_text = " ".join(prefetched.get(s, "") or "" for s in sibling_ids)
         pubmed_text = " ".join(pubmed_prefetched.get(s, "") or "" for s in sibling_ids)
+        press_text = " ".join(
+            (press_release_prefetched or {}).get(s, "") or "" for s in sibling_ids
+        )
 
         provenance: List[str] = []
         for value_field, duration_field in _EFFICACY_FIELD_PAIRS:
@@ -1763,29 +1766,33 @@ def _verify_efficacy_grounding(
                 source = "registry"
             elif _grounding_match(val, pubmed_text):
                 source = "pubmed"
+            elif _grounding_match(val, press_text):
+                source = "press_release"
             else:
                 source = "unverified"
 
             # Record the confirmed source URL in the per-outcome source
-            # column (hba1c_source_url / weight_source_url / etc.). Only
-            # write it if Gemini didn't already fill one in from its own
-            # search (Gemini's URL is more specific — it knows exactly
-            # which press release or paper it read; ours is a best-effort
-            # placeholder from the prefetched content URL or PubMed).
+            # column. Priority: Gemini's own URL (most specific) > press
+            # release URL we fetched > PubMed PMID > CT.gov registry URL.
             source_url_field = value_field.replace("_change_pct", "_source_url") \
                                           .replace("_reduction_pct", "_source_url") \
                                           .replace("_resolution_pct", "_source_url")
             if not row.get(source_url_field):
-                if source == "registry":
-                    # Best available URL: the registry page for this trial.
+                if source == "press_release" and press_release_prefetched:
+                    # Find which press release URL contained the match
+                    acronym = _extract_trial_acronym(
+                        row.get("public_title", "") or row.get("title", "")
+                        or row.get("brief_title", "") or ""
+                    )
+                    if acronym and acronym in _PROGRAM_PRESS_RELEASES:
+                        row[source_url_field] = _PROGRAM_PRESS_RELEASES[acronym][0]
+                elif source == "registry":
                     row[source_url_field] = (
                         row.get("source_url") or row.get("url") or
                         (f"https://clinicaltrials.gov/study/{tid}"
                          if _is_ctgov_id(tid) else "")
                     )
                 elif source == "pubmed":
-                    # The PubMed search found a paper — use the first PMID
-                    # if we can extract it from the abstract text.
                     pmid_m = re.search(r"\bPMID[:\s]+(\d+)\b", pubmed_text, re.IGNORECASE)
                     if pmid_m:
                         row[source_url_field] = (
@@ -1810,12 +1817,230 @@ def _verify_efficacy_grounding(
 
     total = sum(counts.values())
     if total:
-        print(f"  Grounding check: {counts['registry']} value(s) confirmed in the "
-              f"CT.gov record, {counts['pubmed']} in a matched publication, "
+        pr_count = counts.get("press_release", 0)
+        print(f"  Grounding check: {counts['registry']} confirmed in CT.gov, "
+              f"{counts['pubmed']} in PubMed, {pr_count} in press releases, "
               f"{counts['unverified']} UNVERIFIED (of {total} total).",
               file=sys.stderr)
     if blanked:
         print(f"  --strict: blanked {blanked} unverified value(s).", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Press-release prefetch: for trials with known program acronyms (REDEFINE,
+# REIMAGINE etc.) where the CT.gov API record only has protocol text and
+# no results, we also fetch the sponsor's own press release directly.
+# This is the source that makes "unverified" → "press_release" for real
+# results like REDEFINE 2 HbA1c=1.8, which are published by Novo Nordisk
+# but not in the CT.gov results section.
+#
+# We map program acronym → known press release URLs. This is maintained
+# manually as a small lookup; it only grows when new trials publish results.
+# ---------------------------------------------------------------------------
+
+_PROGRAM_PRESS_RELEASES: Dict[str, List[str]] = {
+    "REDEFINE 1": [
+        "https://www.prnewswire.com/news-releases/cagrisema-2-4-mg--2-4-mg-demonstrated-22-7-mean-weight-reduction-in-adults-with-overweight-or-obesity-in-redefine-1--published-in-nejm-302487770.html",
+        "https://www.sec.gov/Archives/edgar/data/353278/000117184324007023/f6k_122024.htm",
+    ],
+    "REDEFINE 2": [
+        "https://www.sec.gov/Archives/edgar/data/353278/000117184325001350/f6k_031025.htm",
+        "https://www.prnewswire.com/news-releases/cagrisema-2-4-mg--2-4-mg-demonstrated-22-7-mean-weight-reduction-in-adults-with-overweight-or-obesity-in-redefine-1--published-in-nejm-302487770.html",
+    ],
+    "REDEFINE 4": [
+        "https://www.novonordisk.com/content/nncorp/global/en/news-and-media/news-and-ir-materials/news-details.html?id=174481",
+    ],
+    "REIMAGINE 1": [
+        "https://www.novonordisk.com/content/nncorp/global/en/news-and-media/news-and-ir-materials/news-details.html?id=922731",
+        "https://www.managedhealthcareexecutive.com/view/cagrisema-reduces-hba1c-weight-across-t2d-spectrum-in-reimagine-trials-ada-2026",
+    ],
+    "REIMAGINE 2": [
+        "https://www.globenewswire.com/news-release/2026/02/02/3230429/0/en/Novo-Nordisk-A-S-CagriSema-demonstrated-superior-HbA1c-reduction-of-1-91-points-and-weight-loss-of-14-2-in-adults-with-type-2-diabetes-in-the-REIMAGINE-2-trial.html",
+        "https://www.novonordisk.com/content/nncorp/global/en/news-and-media/news-and-ir-materials/news-details.html?id=916481",
+    ],
+    "REIMAGINE 3": [
+        "https://www.prnewswire.com/news-releases/novo-nordisks-cagrisema-2-4-mg--2-4-mg-demonstrated-significant-reduction-in-hba1c-and-weight-across-multiple-studies-in-the-reimagine-program-presented-at-ada-2026--302793443.html",
+        "https://www.managedhealthcareexecutive.com/view/cagrisema-reduces-hba1c-weight-across-t2d-spectrum-in-reimagine-trials-ada-2026",
+    ],
+}
+
+_PRESS_RELEASE_FETCH_TIMEOUT = 12
+_PRESS_RELEASE_CONCURRENCY = 3
+_PRESS_RELEASE_MAX_CHARS = 5000
+
+
+async def _fetch_press_release_one(url: str, session: aiohttp.ClientSession,
+                                    semaphore: asyncio.Semaphore) -> str:
+    """Fetch one press release URL, return trimmed text (best-effort)."""
+    async with semaphore:
+        try:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=_PRESS_RELEASE_FETCH_TIMEOUT),
+                headers={"User-Agent": "Mozilla/5.0 (compatible; trial-data-pipeline/1.0)"},
+            ) as resp:
+                if resp.status != 200:
+                    return ""
+                raw = await resp.text(errors="replace")
+                # Very rough HTML-to-text: strip tags, collapse whitespace
+                text = re.sub(r"<[^>]+>", " ", raw)
+                text = re.sub(r"\s+", " ", text).strip()
+                return text[:_PRESS_RELEASE_MAX_CHARS]
+        except Exception as exc:
+            print(f"    [press] fetch failed for {url}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return ""
+
+
+async def _prefetch_press_releases(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """For each trial whose title contains a known program acronym, fetch the
+    known press releases and return {trial_id: combined_text}. Merged into
+    the grounding check alongside the CT.gov API text and PubMed abstract.
+    """
+    # Build acronym -> [trial_id] mapping
+    acronym_to_ids: Dict[str, List[str]] = {}
+    for row in rows:
+        tid = row.get("trial_id", "")
+        if not tid:
+            continue
+        title = (row.get("public_title", "") or row.get("title", "")
+                 or row.get("brief_title", "") or "")
+        acronym = _extract_trial_acronym(title)
+        if acronym and acronym in _PROGRAM_PRESS_RELEASES:
+            acronym_to_ids.setdefault(acronym, []).append(tid)
+
+    if not acronym_to_ids:
+        return {}
+
+    total_urls = sum(len(v) for v in _PROGRAM_PRESS_RELEASES.values()
+                     if any(a in acronym_to_ids for a in _PROGRAM_PRESS_RELEASES))
+    print(f"  Pre-fetching press releases for {len(acronym_to_ids)} program(s) "
+          f"({sum(len(v) for a, v in _PROGRAM_PRESS_RELEASES.items() if a in acronym_to_ids)} URL(s))...",
+          file=sys.stderr)
+
+    # Collect unique URLs to fetch
+    urls_to_fetch: Dict[str, str] = {}  # url -> acronym (first match)
+    for acronym, tids in acronym_to_ids.items():
+        for url in _PROGRAM_PRESS_RELEASES[acronym]:
+            if url not in urls_to_fetch:
+                urls_to_fetch[url] = acronym
+
+    semaphore = asyncio.Semaphore(_PRESS_RELEASE_CONCURRENCY)
+    timeout = aiohttp.ClientTimeout(total=_PRESS_RELEASE_FETCH_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        fetched_texts: List[str] = await asyncio.gather(*[
+            _fetch_press_release_one(url, session, semaphore)
+            for url in urls_to_fetch
+        ])
+
+    url_to_text = dict(zip(urls_to_fetch.keys(), fetched_texts))
+
+    # Map trial_id -> combined text from all press releases for its acronym
+    result: Dict[str, str] = {}
+    for acronym, tids in acronym_to_ids.items():
+        combined = " ".join(
+            url_to_text.get(url, "")
+            for url in _PROGRAM_PRESS_RELEASES[acronym]
+        ).strip()
+        if combined:
+            for tid in tids:
+                existing = result.get(tid, "")
+                result[tid] = (existing + " " + combined).strip()
+
+    fetched = sum(1 for t in result.values() if t)
+    print(f"  Press release prefetch: got text for {fetched}/{len(rows)} trial(s)",
+          file=sys.stderr)
+    return result
+
+
+def _validate_source_urls(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Validate per-outcome source URLs supplied by Gemini.
+
+    The source URL columns (hba1c_source_url, weight_source_url, etc.) are
+    meant to show exactly where each number came from. But Gemini sometimes
+    fabricates these — inventing a plausible-looking URL that doesn't exist
+    or points to the wrong trial. We do three checks:
+
+    1. Basic format: must start with http(s)://. Anything else is cleared.
+    2. Must not be a known-fabrication pattern (StreetInsider SEC filings,
+       generic company homepage without a specific news ID, etc.).
+    3. Must not point to a DIFFERENT trial's NCT ID than the row's own.
+
+    We deliberately do NOT make live HTTP requests here (too slow, too
+    fragile for a batch pipeline). Instead we check structural properties
+    that reliably distinguish real Novo Nordisk/PubMed/NEJM/Lancet URLs
+    from invented ones:
+      - Real PubMed URLs: pubmed.ncbi.nlm.nih.gov/NNNNNNNN/
+      - Real NEJM:        nejm.org/doi/...
+      - Real Lancet:      thelancet.com/...
+      - Real Novo Nordisk: novonordisk.com/.../news-details.html?id=NNNNNN
+      - Real GlobeNewswire: globenewswire.com/news-release/YYYY/MM/DD/...
+      - Real PRNewswire:  prnewswire.com/news-releases/...
+      - Real ACC/ADA/etc. medical society: clear pattern, no NCT mismatch
+
+    Anything that doesn't pass is blanked (not flagged — a blank source URL
+    is less confusing than a wrong one).
+    """
+    # Patterns that match known-good source URL formats
+    TRUSTED_DOMAINS = re.compile(
+        r"https?://(www\.)?(pubmed\.ncbi\.nlm\.nih\.gov|pmc\.ncbi\.nlm\.nih\.gov"
+        r"|nejm\.org|thelancet\.com|novonordisk\.com|globenewswire\.com"
+        r"|prnewswire\.com|sec\.gov|biospace\.com|healio\.com|hcplive\.com"
+        r"|managedhealthcareexecutive\.com|endocrinologyadvisor\.com"
+        r"|acc\.org|diabetes\.org|ama-assn\.org|jamanetwork\.com"
+        r"|clinicaltrials\.gov|pharmacally\.com|drugtopics\.com"
+        r"|renalandurologynews\.com|patientcareonline\.com)",
+        re.IGNORECASE,
+    )
+    # Patterns that are known to be fabricated or unhelpful
+    BAD_PATTERNS = re.compile(
+        r"streetinsider\.com"  # commonly fabricated by LLMs for SEC filings
+        r"|investopedia\.com"
+        r"|wikipedia\.org",
+        re.IGNORECASE,
+    )
+    nct_in_url = re.compile(r"NCT\d{8}", re.IGNORECASE)
+
+    source_url_fields = [
+        "hba1c_source_url", "weight_source_url",
+        "alt_source_url", "mash_source_url",
+    ]
+    cleared = 0
+    for tid, row in rows_by_id.items():
+        for field in source_url_fields:
+            url = str(row.get(field, "") or "").strip()
+            if not url or url.lower() == "n/a":
+                row[field] = ""
+                continue
+            # Must be a real URL
+            if not url.startswith(("http://", "https://")):
+                row[field] = ""
+                cleared += 1
+                continue
+            # Must be from a trusted domain
+            if not TRUSTED_DOMAINS.match(url):
+                print(f"  [warn] {tid}: {field} points to an untrusted domain, "
+                      f"clearing: {url[:80]}", file=sys.stderr)
+                row[field] = ""
+                cleared += 1
+                continue
+            # Must not be a known-bad pattern
+            if BAD_PATTERNS.search(url):
+                print(f"  [warn] {tid}: {field} matches a known-fabrication "
+                      f"pattern, clearing: {url[:80]}", file=sys.stderr)
+                row[field] = ""
+                cleared += 1
+                continue
+            # If the URL contains an NCT ID, it must match this row's own
+            nct_m = nct_in_url.search(url)
+            if nct_m and _is_ctgov_id(tid) and nct_m.group(0).upper() != tid.upper():
+                print(f"  [warn] {tid}: {field} contains a different trial ID "
+                      f"({nct_m.group(0)}), clearing: {url[:80]}", file=sys.stderr)
+                row[field] = ""
+                cleared += 1
+                continue
+    if cleared:
+        print(f"  Cleared {cleared} invalid/fabricated source URL(s) across "
+              f"per-outcome source columns.", file=sys.stderr)
 
 
 def _parse_loose_date(value: str) -> Optional[date]:
@@ -1945,6 +2170,13 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # relying solely on prompting Gemini to search harder.
     pubmed_prefetched = await _prefetch_pubmed(list(rows_by_id.values()))
 
+    # Also prefetch known sponsor press releases for trials with published
+    # results — these are the primary source for values that are real but
+    # don't appear in CT.gov API text or PubMed abstracts (e.g. REDEFINE 2
+    # HbA1c=1.8 is in a Novo Nordisk/ADA press release, not in the CT.gov
+    # record which only has protocol text).
+    press_release_prefetched = await _prefetch_press_releases(list(rows_by_id.values()))
+
     # Detect acronym collisions (e.g. two unrelated trials both informally
     # called "REDEFINE 4" in outside press coverage) so the per-trial prompt
     # can warn Gemini to verify a match before assigning press-release data
@@ -2025,7 +2257,12 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # actually grounded in a source over one that merely appears in more
     # duplicate rows.
     _verify_efficacy_grounding(rows_by_id, prefetched, pubmed_prefetched,
+                               press_release_prefetched=press_release_prefetched,
                                strict=strict)
+
+    # Validate Gemini-supplied per-outcome source URLs — clear fabricated,
+    # untrusted-domain, or wrong-trial URLs before they reach the output.
+    _validate_source_urls(rows_by_id)
 
     # --- Pass 4 (no API calls): reconcile contradictions between rows that
     # share the same underlying trial but ended up with DIFFERENT efficacy
