@@ -695,6 +695,11 @@ FINAL_COLUMNS = [
     "mash_duration",
     "company_name",
     "source_url",
+    # Per-value audit trail written by _verify_efficacy_grounding: says, for
+    # each efficacy number present, whether it was actually found in the
+    # CT.gov record ("registry"), in a matched publication ("pubmed"), or
+    # in neither ("unverified"). Read this before trusting a number.
+    "efficacy_provenance",
 ]
 
 
@@ -752,6 +757,7 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
         "mash_duration": row.get("mash_duration", ""),
         "company_name": row.get("company_name", "") or row.get("sponsor", ""),
         "source_url": row.get("source_url", "") or row.get("url", ""),
+        "efficacy_provenance": row.get("efficacy_provenance", ""),
     }
 
 
@@ -1249,8 +1255,33 @@ async def _run_batches(drug: str, batches: List[tuple], extra_suffix: str = "",
 
     results = await asyncio.gather(*[
         run_batch(i, source, batch) for i, (source, batch) in enumerate(batches)
-    ])
-    return [t for batch in results for t in batch if isinstance(t, dict)]
+    ], return_exceptions=True)
+
+    # A batch that still failed after gemini_call_with_search's own retries
+    # (e.g. Gemini returned 503 on every attempt) shouldn't take the whole
+    # run down with it — every OTHER batch's results are still good and
+    # worth keeping. Log the failure, treat that batch as having returned
+    # nothing, and let the normal "still missing" bookkeeping (Pass 2 retry,
+    # the final [warn] summary) pick up its trials instead.
+    flattened: List[Dict[str, Any]] = []
+    failed_batches = 0
+    for (source, batch), result in zip(batches, results):
+        if isinstance(result, Exception):
+            failed_batches += 1
+            ids = [s.get("NCT_ID", "?") for s in batch]
+            print(f"  [{label}] ❌ Batch [{source}] permanently failed after "
+                  f"retries ({type(result).__name__}: {result}) — trial(s) "
+                  f"{', '.join(ids)} got NO data from this batch and will be "
+                  f"picked up by the retry pass if one runs.", file=sys.stderr)
+            continue
+        flattened.extend(result)
+
+    if failed_batches:
+        print(f"  [{label}] {failed_batches}/{len(batches)} batch(es) failed "
+              f"outright — see ❌ lines above. Run continuing with the rest.",
+              file=sys.stderr)
+
+    return flattened
 
 
 def _normalise_trial_id(trial_id: str) -> str:
@@ -1468,12 +1499,23 @@ def _reconcile_conflicting_efficacy(rows_by_id: Dict[str, Dict[str, Any]]) -> No
             # matching durations from different rows.
             pair_by_value: Dict[str, str] = {}
             votes: Dict[str, int] = {}
+            grounded_values: set = set()
             for row in rows:
                 val = str(row.get(value_field, "")).strip()
                 if not val:
                     continue
                 dur = str(row.get(duration_field, "")).strip()
                 votes[val] = votes.get(val, 0) + 1
+                # Did the grounding check confirm THIS value against a real
+                # retrieved source? Cross-registry propagation means a
+                # hallucinated number can be copied into several sibling
+                # rows and then win a naive popularity contest, so evidence
+                # has to outrank vote count.
+                prov = str(row.get("efficacy_provenance", ""))
+                label = value_field.replace("_change_pct", "").replace("_reduction_pct", "") \
+                                   .replace("_resolution_pct", "")
+                if f"{label}=registry" in prov or f"{label}=pubmed" in prov:
+                    grounded_values.add(val)
                 # Prefer the first duration seen paired with this value;
                 # if a later row has the same value but a non-empty
                 # duration and we don't have one yet, take it.
@@ -1488,17 +1530,27 @@ def _reconcile_conflicting_efficacy(rows_by_id: Dict[str, Dict[str, Any]]) -> No
             # non-empty paired duration (more likely to have come from an
             # actual source rather than a bare guess), then by the value
             # itself for a stable, reproducible result.
+            # Rank: (1) grounded in a real retrieved source beats ungrounded,
+            # ALWAYS — a value confirmed in the CT.gov record or a
+            # publication outranks one that merely appears in more rows;
+            # (2) then vote count; (3) then having a paired duration;
+            # (4) then the value itself, for stable output.
             def _sort_key(v: str):
-                return (-votes[v], 0 if pair_by_value.get(v) else 1, v)
+                return (0 if v in grounded_values else 1,
+                        -votes[v],
+                        0 if pair_by_value.get(v) else 1,
+                        v)
 
             winner = sorted(distinct_values, key=_sort_key)[0]
             winner_duration = pair_by_value.get(winner, "")
+            basis = "grounded in a retrieved source" if winner in grounded_values \
+                    else "majority vote — NONE of these values were grounded"
 
             conflicts_found += 1
             print(f"  [warn] Conflicting {value_field} across {len(tids)} row(s) "
                   f"for the same trial ({', '.join(tids)}): "
-                  f"{dict(votes)} — keeping {winner!r} "
-                  f"(majority vote) for all rows in this group", file=sys.stderr)
+                  f"{dict(votes)} — keeping {winner!r} ({basis}) "
+                  f"for all rows in this group", file=sys.stderr)
 
             for row in rows:
                 row[value_field] = winner
@@ -1565,6 +1617,119 @@ def _fix_mismatched_source_urls(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
     if fixed:
         print(f"  Fixed {fixed} source_url value(s) that pointed at a "
               f"different trial's NCT ID than the row's own", file=sys.stderr)
+
+
+def _numeric_variants(value: str) -> List[str]:
+    """Surface forms the same number might legitimately take in source text.
+
+    A source may print 12.0 as "12", 2.30 as "2.3", or 20.4 as "20.4%".
+    We generate the plausible spellings so a real, correctly-extracted
+    value isn't flagged as ungrounded purely over formatting.
+    """
+    raw = str(value or "").strip().replace("%", "").replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", raw)
+    if not m:
+        return []
+    num = m.group(0)
+    variants = {num}
+    try:
+        f = float(num)
+    except ValueError:
+        return list(variants)
+    # 12.0 -> "12";  2.30 -> "2.3";  13 -> "13.0"
+    if f == int(f):
+        variants.add(str(int(f)))
+        variants.add(f"{int(f)}.0")
+    variants.add(f"{f:g}")
+    variants.add(f"{f:.1f}")
+    variants.add(f"{f:.2f}")
+    return [v for v in variants if v]
+
+
+def _verify_efficacy_grounding(
+    rows_by_id: Dict[str, Dict[str, Any]],
+    prefetched: Dict[str, str],
+    pubmed_prefetched: Dict[str, str],
+    strict: bool = False,
+) -> None:
+    """Check every efficacy number against text we ACTUALLY retrieved, and
+    record where (if anywhere) it was found.
+
+    THIS IS THE ONLY CHECK THAT CAN CATCH A CONFIDENT, SELF-CONSISTENT
+    HALLUCINATION. Every other pass in this file compares rows against each
+    OTHER — conflict reconciliation, orphan-duration dropping, URL fixing.
+    Those catch contradictions, but a number invented once and never
+    contradicted (e.g. REDEFINE 1 coming back as 25.0% when the published
+    figure is 22.7%, or REDEFINE 2's numbers copied wholesale onto the
+    still-running REDEFINE 3) sails through all of them. Grounding is the
+    difference between "internally consistent" and "true".
+
+    For each efficacy value we search the trial's own prefetched CT.gov API
+    text and PubMed abstract, plus those of any row grouped as the same
+    underlying trial (an EU duplicate legitimately inherits its CT.gov
+    sibling's evidence). The result is written to a per-row provenance
+    field:
+      registry  — found in the CT.gov API record
+      pubmed    — found in the matched publication abstract
+      unverified— Gemini reported it, but it appears in NEITHER source we
+                  hold. It may still be true (press releases and conference
+                  abstracts are real sources we don't prefetch) — but it is
+                  UNCHECKED, and every fabricated value found by hand so
+                  far landed in this bucket.
+
+    strict=True additionally BLANKS unverified values. That trades recall
+    for trustworthiness: it will also delete genuine press-release-only
+    figures. Off by default so the default run stays complete; the
+    provenance column tells you which cells to trust either way.
+    """
+    groups = _group_related_trial_ids(rows_by_id)
+    group_of = {tid: grp for grp in groups for tid in grp}
+
+    counts = {"registry": 0, "pubmed": 0, "unverified": 0}
+    blanked = 0
+
+    for tid, row in rows_by_id.items():
+        sibling_ids = group_of.get(tid, [tid])
+        registry_text = " ".join(prefetched.get(s, "") or "" for s in sibling_ids)
+        pubmed_text = " ".join(pubmed_prefetched.get(s, "") or "" for s in sibling_ids)
+
+        provenance: List[str] = []
+        for value_field, duration_field in _EFFICACY_FIELD_PAIRS:
+            val = str(row.get(value_field, "")).strip()
+            if not val:
+                continue
+            variants = _numeric_variants(val)
+            if variants and any(v in registry_text for v in variants):
+                source = "registry"
+            elif variants and any(v in pubmed_text for v in variants):
+                source = "pubmed"
+            else:
+                source = "unverified"
+
+            counts[source] += 1
+            label = value_field.replace("_change_pct", "").replace("_reduction_pct", "") \
+                               .replace("_resolution_pct", "")
+            provenance.append(f"{label}={source}")
+
+            if source == "unverified":
+                print(f"  [warn] {tid}: {value_field}={val!r} could not be found in "
+                      f"the CT.gov record or any matched publication — UNVERIFIED, "
+                      f"treat as unconfirmed until checked by hand.", file=sys.stderr)
+                if strict:
+                    row[value_field] = ""
+                    row[duration_field] = ""
+                    blanked += 1
+
+        row["efficacy_provenance"] = "; ".join(provenance)
+
+    total = sum(counts.values())
+    if total:
+        print(f"  Grounding check: {counts['registry']} value(s) confirmed in the "
+              f"CT.gov record, {counts['pubmed']} in a matched publication, "
+              f"{counts['unverified']} UNVERIFIED (of {total} total).",
+              file=sys.stderr)
+    if blanked:
+        print(f"  --strict: blanked {blanked} unverified value(s).", file=sys.stderr)
 
 
 def _parse_loose_date(value: str) -> Optional[date]:
@@ -1646,7 +1811,8 @@ def _chunk_by_source(rows: List[Dict[str, Any]], batch_size: int,
 
 async def enrich(drug: str, max_records: Optional[int] = None,
                   sources: Optional[List[str]] = None,
-                  retry_missing: bool = True) -> List[Dict[str, Any]]:
+                  retry_missing: bool = True,
+                  strict: bool = False) -> List[Dict[str, Any]]:
     sources = sources or list(SOURCE_MODULES.keys())
     active = [s for s in sources if s in SOURCE_MODULES]
     missing = [s for s in sources if s not in SOURCE_MODULES]
@@ -1767,6 +1933,14 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # doesn't, copy it across. This is free — no Gemini calls needed.
     _propagate_efficacy_by_url(rows_by_id)
 
+    # --- Pass 3.5 (no API calls): GROUNDING CHECK. Verify every efficacy
+    # number against text we actually retrieved. This runs BEFORE conflict
+    # reconciliation so the majority vote below can prefer a value that is
+    # actually grounded in a source over one that merely appears in more
+    # duplicate rows.
+    _verify_efficacy_grounding(rows_by_id, prefetched, pubmed_prefetched,
+                               strict=strict)
+
     # --- Pass 4 (no API calls): reconcile contradictions between rows that
     # share the same underlying trial but ended up with DIFFERENT efficacy
     # numbers (as opposed to Pass 3's gap-filling, this fixes disagreement).
@@ -1837,6 +2011,14 @@ def main() -> int:
                           "'ctgov' (ClinicalTrials.gov), 'euct' (EU CTIS + EudraCT), "
                           f"or both (default). Available on this machine: "
                           f"{', '.join(SOURCE_MODULES) or 'none'}")
+    ap.add_argument("--strict", action="store_true",
+                     help="blank any efficacy value that could not be found in the "
+                          "CT.gov record or a matched publication. Maximises "
+                          "trustworthiness at the cost of recall: genuine "
+                          "press-release-only figures will also be dropped. "
+                          "Without this flag nothing is deleted — unverified "
+                          "values are kept and marked in the efficacy_provenance "
+                          "column instead.")
     ap.add_argument("--no-retry", action="store_true",
                      help="skip the automatic single-trial retry pass for trials "
                           "that came back with no efficacy data (faster, fewer API calls, "
@@ -1845,7 +2027,8 @@ def main() -> int:
 
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
     rows = asyncio.run(enrich(args.drug, args.max_records, sources,
-                               retry_missing=not args.no_retry))
+                               retry_missing=not args.no_retry,
+                               strict=args.strict))
 
     if not rows:
         print("No trials found / enriched.", file=sys.stderr)
@@ -1856,6 +2039,15 @@ def main() -> int:
     print(f"  Final: {len(rows) - still_empty}/{len(rows)} trial(s) have at least "
           f"some efficacy data; {still_empty} have none (likely no results published yet).",
           file=sys.stderr)
+    unverified_rows = [r for r in rows
+                       if "unverified" in str(r.get("efficacy_provenance", ""))]
+    if unverified_rows:
+        print(f"  Final: {len(unverified_rows)} row(s) contain at least one "
+              f"UNVERIFIED efficacy value (present in neither the CT.gov record "
+              f"nor a matched publication). See the efficacy_provenance column; "
+              f"re-run with --strict to blank these instead of keeping them.",
+              file=sys.stderr)
+
     if still_core_missing:
         print(f"  Final: {still_core_missing}/{len(rows)} trial(s) are still missing "
               f"a core field (title/phase/size/location/status/start date) after "

@@ -178,18 +178,27 @@ async def gemini_call_with_search(prompt: str, model: str, response_mime_type: s
         except Exception as e:
             error_str = str(e).lower()
 
-            # Check for rate limit errors
-            if any(err in error_str for err in ["429", "rate limit", "quota", "resource exhausted"]):
+            # Check for retryable transient errors: 429/quota (rate limiting)
+            # AND 503/500/"overloaded"/"unavailable" (the model itself is
+            # temporarily overloaded or the backend had a transient hiccup —
+            # Gemini surfaces this as a 503 fairly often under load, and it
+            # is just as transient/retryable as a rate limit, not a reason
+            # to give up on the whole batch).
+            retryable = ["429", "rate limit", "quota", "resource exhausted",
+                         "503", "500", "502", "504", "unavailable",
+                         "overloaded", "internal error", "deadline exceeded"]
+            if any(err in error_str for err in retryable):
                 retry_count += 1
                 if retry_count > MAX_RETRIES:
-                    print(f"\n  ❌ Max retries ({MAX_RETRIES}) exceeded for rate limit. Error: {e}")
+                    print(f"\n  ❌ Max retries ({MAX_RETRIES}) exceeded. Error: {e}")
                     raise
 
-                print(f"\n  ⚠️  Rate limit hit - waiting {backoff_delay:.1f}s before retry {retry_count}/{MAX_RETRIES}...")
+                reason = "Rate limit" if any(r in error_str for r in ("429", "rate limit", "quota", "resource exhausted")) else "Transient server error (503/overloaded)"
+                print(f"\n  ⚠️  {reason} hit - waiting {backoff_delay:.1f}s before retry {retry_count}/{MAX_RETRIES}...")
                 await asyncio.sleep(backoff_delay)
                 backoff_delay *= 2  # Exponential backoff: 2s, 4s, 8s, 16s, 32s
             else:
-                # Non-rate-limit error, raise immediately
+                # Non-retryable error, raise immediately
                 print(f"  ❌ Gemini API error: {e}")
                 raise
 
