@@ -2043,12 +2043,151 @@ def _validate_source_urls(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
               f"per-outcome source columns.", file=sys.stderr)
 
 
+def _enforce_source_url_requirement(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Blank any efficacy value that has no source URL after all passes.
+
+    A missing source URL means Gemini found a number but has no evidence
+    trail for it — which is the defining characteristic of every confirmed
+    hallucination found by hand-verification so far (REDEFINE 3 copying
+    REDEFINE 2's numbers, NCT04982575 ALT=31.8, the 28.4% EU weight row,
+    etc.). In every case the value was unverified AND the source URL was
+    empty or fabricated (and already cleared by _validate_source_urls).
+
+    Two classes of exceptions are allowed:
+    1. A non-empty efficacy_provenance tag of "registry", "pubmed", or
+       "press_release" means _verify_efficacy_grounding already confirmed
+       the value in a real retrieved source — even though Gemini didn't
+       record a URL, we have evidence it's real, and the grounding check
+       itself backfills the source URL. So these are kept.
+    2. If grounding ran but came back "unverified" AND the source URL is
+       blank, the value is cleared unconditionally.
+
+    This is run AFTER _validate_source_urls so fabricated URLs are already
+    gone and after _verify_efficacy_grounding so provenance tags exist.
+    """
+    field_to_label = {
+        "hba1c_change_pct": "hba1c",
+        "weight_change_pct": "weight",
+        "alt_reduction_pct": "alt",
+        "mash_resolution_pct": "mash",
+    }
+    blanked = 0
+    for tid, row in rows_by_id.items():
+        prov = str(row.get("efficacy_provenance", ""))
+        for value_field, duration_field in _EFFICACY_FIELD_PAIRS:
+            val = str(row.get(value_field, "")).strip()
+            if not val:
+                continue
+            label = field_to_label.get(value_field, "")
+            source_url_field = value_field.replace("_change_pct", "_source_url") \
+                                          .replace("_reduction_pct", "_source_url") \
+                                          .replace("_resolution_pct", "_source_url")
+            has_url = bool(str(row.get(source_url_field, "") or "").strip())
+
+            # Check provenance tag for this specific field
+            confirmed = (f"{label}=registry" in prov
+                         or f"{label}=pubmed" in prov
+                         or f"{label}=press_release" in prov)
+
+            if not has_url and not confirmed:
+                print(f"  [enforce] {tid}: clearing {value_field}={val!r} — "
+                      f"no source URL and not confirmed in any retrieved source",
+                      file=sys.stderr)
+                row[value_field] = ""
+                row[duration_field] = ""
+                blanked += 1
+
+    if blanked:
+        print(f"  Source URL enforcement: cleared {blanked} ungrounded value(s) "
+              f"with no source URL.", file=sys.stderr)
+
+
+def _block_efficacy_on_non_results_trials(rows_by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Clear efficacy values on trials where results cannot possibly exist.
+
+    The persistent contamination pattern is: a completed trial's numbers
+    get copied onto an ongoing/recruiting/CVOT trial with a similar program
+    name, or a PK/mechanism study that never measured efficacy endpoints.
+    Neither the grounding check nor conflict reconciliation catches this
+    when the contamination is applied consistently across all sibling rows.
+
+    Rules:
+    - Recruiting / Active / Not yet recruiting / Withdrawn → no results
+    - Phase 1 PK/mechanism/appetite/bone/bioequivalence titles → no efficacy
+    Exception: EU duplicate rows pointing at a DIFFERENT (completed)
+    trial's NCT ID in their source_url carry that trial's results
+    legitimately and are left alone.
+    """
+    NO_RESULTS_STATUSES = {
+        "recruiting", "active, not recruiting", "active",
+        "not yet recruiting", "withdrawn", "terminated",
+    }
+    PK_TITLE_FRAGMENTS = (
+        "blood levels", "pharmacokinetics", "single dose",
+        "bioequivalence", "muscle health", "bone metabolism",
+        "gastric emptying", "food intake", "appetite", "atorvastatin",
+        "warfarin", "insulin sensitivity", "insulin effect",
+        "metabolism is influenced",
+    )
+    nct_pat = re.compile(r"NCT\d{8}", re.IGNORECASE)
+    cleared = 0
+
+    for tid, row in rows_by_id.items():
+        if not any(str(row.get(f, "")).strip() for f, _ in _EFFICACY_FIELD_PAIRS):
+            continue
+
+        status = str(row.get("phase_status", "")).strip().lower()
+        phase = str(row.get("phase", "")).strip()
+        title = (str(row.get("trial_title", "") or row.get("title", "")
+                     or row.get("public_title", "") or "")).lower()
+        source_url = str(row.get("source_url", "") or "").upper()
+        own_nct = tid.upper() if _is_ctgov_id(tid) else ""
+
+        # EU duplicate pointing at a different trial's NCT — leave alone.
+        # EU trial IDs (CT numbers like 2023-506931-13-00) are never NCT
+        # format themselves, so if the row is non-NCT AND its source_url
+        # points at an NCT ID, it's definitely an EU duplicate row carrying
+        # a completed sibling's results — don't clear it.
+        url_m = nct_pat.search(source_url)
+        url_nct = url_m.group(0).upper() if url_m else ""
+        is_eu_row = not _is_ctgov_id(tid)
+        if is_eu_row and url_nct:
+            continue  # EU row with NCT reference — leave efficacy alone
+        if url_nct and own_nct and url_nct != own_nct:
+            continue  # CT.gov row pointing at a different trial
+
+        should_clear = False
+        reason = ""
+        if status in NO_RESULTS_STATUSES:
+            should_clear = True
+            reason = f"trial status is {row.get('phase_status')!r}"
+        elif phase == "1" and any(frag in title for frag in PK_TITLE_FRAGMENTS):
+            should_clear = True
+            reason = "Phase 1 PK/mechanism study"
+
+        if should_clear:
+            for val_f, dur_f in _EFFICACY_FIELD_PAIRS:
+                if str(row.get(val_f, "")).strip():
+                    print(f"  [enforce] {tid}: clearing {val_f}={row[val_f]!r} — "
+                          f"{reason}", file=sys.stderr)
+                    row[val_f] = ""
+                    row[dur_f] = ""
+                    src_f = val_f.replace("_change_pct", "_source_url") \
+                                 .replace("_reduction_pct", "_source_url") \
+                                 .replace("_resolution_pct", "_source_url")
+                    row[src_f] = ""
+                    cleared += 1
+
+    if cleared:
+        print(f"  Status/type enforcement: cleared {cleared} value(s) from "
+              f"trials that cannot have published results.", file=sys.stderr)
+
+
 def _parse_loose_date(value: str) -> Optional[date]:
     """Best-effort parse of the date formats actually seen in this
     pipeline's output: ISO (YYYY-MM-DD), year-month (YYYY-MM), and the
     DD/MM/YYYY style some EU CTIS/EudraCT rows come back in. Returns None
-    for anything unparseable rather than raising — this is only used for
-    a sanity check, not as a value written back to any row.
+    for anything unparseable rather than raising.
     """
     value = str(value or "").strip()
     if not value:
@@ -2263,6 +2402,17 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     # Validate Gemini-supplied per-outcome source URLs — clear fabricated,
     # untrusted-domain, or wrong-trial URLs before they reach the output.
     _validate_source_urls(rows_by_id)
+
+    # Clear efficacy values on trials whose status means no readout can
+    # exist yet (Recruiting, Active, etc.) — handles the contamination
+    # case where CVOT/ongoing trial gets a completed trial's numbers.
+    # Runs before source-URL enforcement so we don't waste cycles on rows
+    # that should be blank regardless.
+    _block_efficacy_on_non_results_trials(rows_by_id)
+
+    # Clear any remaining efficacy value that has neither a source URL nor
+    # a confirmed provenance tag — these are the residual hallucinations.
+    _enforce_source_url_requirement(rows_by_id)
 
     # --- Pass 4 (no API calls): reconcile contradictions between rows that
     # share the same underlying trial but ended up with DIFFERENT efficacy
