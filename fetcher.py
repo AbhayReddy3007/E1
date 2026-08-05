@@ -103,6 +103,7 @@ ALL_COLUMNS = [
     "alt_reduction_pct", "alt_duration",     "alt_rationale",    "alt_confidence",
     "mash_change_pct",   "mash_duration",    "mash_rationale",   "mash_confidence",
     "company_name", "source_url",
+    "dim3_weighted_score", "dim3_data_coverage", "dim3_score_breakdown", "dim3_narrative_rationale",
 ]
 
 COLUMN_WIDTHS = {
@@ -115,6 +116,8 @@ COLUMN_WIDTHS = {
     "alt_reduction_pct": 16, "alt_duration": 14,     "alt_rationale": 45,    "alt_confidence": 14,
     "mash_change_pct": 18,   "mash_duration": 14,    "mash_rationale": 45,   "mash_confidence": 14,
     "company_name": 28, "source_url": 40,
+    "dim3_weighted_score": 20, "dim3_data_coverage": 28,
+    "dim3_score_breakdown": 50, "dim3_narrative_rationale": 60,
 }
 
 # ==============================================================================
@@ -672,24 +675,18 @@ SCORING METHODOLOGY:
 - Weighted average: Weight Loss (40%) + HbA1c (40%) + MASH (10%) + ALT (10%)
 
 YOUR TASK:
-Write a comprehensive 4-5 paragraph clinical rationale that:
+Write a concise clinical rationale in EXACTLY 3 sentences:
 
-1. Opening paragraph: State the clinical efficacy score and provide a high-level summary of {molecule}'s clinical performance.
-
-2. Weight Loss paragraph: Discuss weight loss efficacy - MUST reference specific percentage, duration, dosage, phase, trial ID, and comparison to clinical benchmarks (>15% excellent, 10-15% good).
-
-3. HbA1c Reduction paragraph: Discuss glycemic control - MUST reference specific percentage, duration, dosage, phase, trial ID (>2% excellent, 1-2% good for diabetes management).
-
-4. MASH/ALT paragraph (if data available): Discuss liver endpoints with duration context. If N/A, briefly explain why.
-
-5. Concluding paragraph: Summarize score rationale, data quality (phase distribution, sample sizes), and why this score represents the molecule's true clinical efficacy profile.
+1. Sentence 1: State the overall clinical efficacy score and briefly summarise {molecule}'s performance across the scored endpoints.
+2. Sentence 2: Highlight the strongest endpoint(s) with specific percentage, dosage, duration, phase, and trial ID.
+3. Sentence 3: Note any missing endpoints or data gaps and state what the score reflects about the molecule's overall clinical profile.
 
 WRITING GUIDELINES:
-- Include dosage and duration for each endpoint (e.g., "achieved 15% weight loss at 2.4 mg over 68 weeks")
-- Use specific numbers from the data (percentages, trial IDs, phase info)
+- EXACTLY 3 sentences — no more, no less
+- Include specific numbers (percentages, trial IDs, phase info, dosage, duration) where available
 - Be objective and evidence-based with medical terminology
-- Plain text with paragraph breaks only - no markdown, no headers, no bullets
-- Do not use phrases like "The rationale is..." - write the rationale directly
+- Plain text only — no markdown, no headers, no bullets, no paragraph breaks
+- Do not use phrases like "The rationale is..." — write the rationale directly
 - Write as documentation for regulatory or pharma stakeholders
 
 IMPORTANT: Use trial_id, dosage, and duration ONLY from the ENDPOINT PERFORMANCE section above. Do not invent or infer from other sources.
@@ -745,27 +742,45 @@ def _write_excel(
     score_result: Optional[Dict[str, Any]] = None,
     score_rationale: Optional[str] = None,
 ) -> None:
-    """Write enriched rows + optional Score Summary sheet to the workbook."""
+    """Write enriched rows to a single 'Clinical Trials (Enriched)' sheet.
+
+    Score summary columns (dim3_weighted_score, dim3_data_coverage,
+    dim3_score_breakdown, dim3_narrative_rationale) are appended as regular
+    columns on every row when scoring was run — no second sheet is created.
+    """
     from openpyxl import Workbook
+
+    # ── stamp score values onto every row ────────────────────────────────────
+    if score_result:
+        for row_data in rows:
+            row_data["dim3_weighted_score"]      = str(score_result.get("weighted_score", ""))
+            row_data["dim3_data_coverage"]       = score_result.get("data_coverage", "")
+            row_data["dim3_score_breakdown"]     = score_result.get("score_breakdown", "")
+            row_data["dim3_narrative_rationale"] = score_rationale or ""
 
     wb = Workbook()
 
-    # ---- Sheet 1: Clinical Trials (Enriched) ---------------------------------
+    # ---- Single sheet: Clinical Trials (Enriched) ---------------------------
     ws = wb.active
     ws.title = "Clinical Trials (Enriched)"
 
-    HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
-    HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-    DATA_FONT   = Font(name="Arial", size=9)
-    WRAP_ALIGN  = Alignment(wrap_text=True, vertical="top")
-    THIN        = Side(style="thin", color="D0D0D0")
-    BORDER      = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-    ALT_FILL    = PatternFill("solid", fgColor="EBF5FB")
-    ENRICH_FILL = PatternFill("solid", fgColor="E8F8E8")
+    HEADER_FILL  = PatternFill("solid", fgColor="1F4E79")
+    HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    DATA_FONT    = Font(name="Arial", size=9)
+    WRAP_ALIGN   = Alignment(wrap_text=True, vertical="top")
+    THIN         = Side(style="thin", color="D0D0D0")
+    BORDER       = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    ALT_FILL     = PatternFill("solid", fgColor="EBF5FB")
+    ENRICH_FILL  = PatternFill("solid", fgColor="E8F8E8")
+    SCORE_FILL   = PatternFill("solid", fgColor="D4EDDA")   # light green for score cols
+
+    SCORE_COLS = {"dim3_weighted_score", "dim3_data_coverage",
+                  "dim3_score_breakdown", "dim3_narrative_rationale"}
 
     extra_cols = [c for c in (rows[0].keys() if rows else []) if c not in ALL_COLUMNS]
     columns = ALL_COLUMNS + extra_cols
     enriched_col_idxs = {i + 1 for i, c in enumerate(columns) if c in OUTCOME_COLS}
+    score_col_idxs    = {i + 1 for i, c in enumerate(columns) if c in SCORE_COLS}
 
     ws.append(columns)
     for cell in ws[1]:
@@ -781,7 +796,9 @@ def _write_excel(
             cell.font      = DATA_FONT
             cell.alignment = WRAP_ALIGN
             cell.border    = BORDER
-            if c_idx in enriched_col_idxs:
+            if c_idx in score_col_idxs:
+                cell.fill = SCORE_FILL
+            elif c_idx in enriched_col_idxs:
                 cell.fill = ENRICH_FILL
             elif alt:
                 cell.fill = ALT_FILL
@@ -792,140 +809,11 @@ def _write_excel(
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
-    # ---- Sheet 2: Score Summary (if scoring was run) -------------------------
-    if score_result:
-        ws2 = wb.create_sheet(title="Score Summary")
-
-        SCORE_HEADER_FILL  = PatternFill("solid", fgColor="1F4E79")
-        SCORE_HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-        SECTION_FILL       = PatternFill("solid", fgColor="2E86AB")
-        SECTION_FONT       = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        LABEL_FONT         = Font(name="Arial", bold=True, size=10)
-        VALUE_FONT         = Font(name="Arial", size=10)
-        SCORE_FILL         = PatternFill("solid", fgColor="D4EDDA")  # light green
-        MISSING_FILL       = PatternFill("solid", fgColor="FFF3CD")  # light yellow
-        WRAP               = Alignment(wrap_text=True, vertical="top")
-        CENTER             = Alignment(horizontal="center", vertical="center")
-        THIN2              = Side(style="thin", color="CCCCCC")
-        BDR                = Border(left=THIN2, right=THIN2, top=THIN2, bottom=THIN2)
-
-        eps = score_result.get("endpoints", {})
-        molecule = score_result.get("molecule", "")
-        ws2.column_dimensions["A"].width = 30
-        ws2.column_dimensions["B"].width = 22
-        ws2.column_dimensions["C"].width = 22
-        ws2.column_dimensions["D"].width = 18
-        ws2.column_dimensions["E"].width = 18
-        ws2.column_dimensions["F"].width = 55
-
-        row = 1
-
-        # Title
-        ws2.merge_cells(f"A{row}:F{row}")
-        title_cell = ws2[f"A{row}"]
-        title_cell.value      = f"Dimension III – Clinical Efficacy Score: {molecule}"
-        title_cell.font       = SCORE_HEADER_FONT
-        title_cell.fill       = SCORE_HEADER_FILL
-        title_cell.alignment  = CENTER
-        row += 1
-
-        # Overall score
-        ws2.merge_cells(f"A{row}:F{row}")
-        score_cell = ws2[f"A{row}"]
-        ws_val = score_result.get("weighted_score", 0)
-        score_cell.value     = f"Weighted Score: {ws_val:.3f} / 5.0   |   {score_result.get('data_coverage','')}"
-        score_cell.font      = Font(name="Arial", bold=True, size=12, color="1F4E79")
-        score_cell.fill      = SCORE_FILL
-        score_cell.alignment = CENTER
-        row += 1
-        row += 1  # spacer
-
-        # Endpoint breakdown header
-        for col_letter, header in zip(
-            ["A", "B", "C", "D", "E", "F"],
-            ["Endpoint (Weight)", "Raw Value (%)", "Adj. Value (%)", "Phase Used", "Score (1-5)", "Trial Used / Reason"],
-        ):
-            c = ws2[f"{col_letter}{row}"]
-            c.value     = header
-            c.font      = SECTION_FONT
-            c.fill      = SECTION_FILL
-            c.alignment = CENTER
-            c.border    = BDR
-        row += 1
-
-        # One row per endpoint
-        ep_labels = {
-            "weight_loss": "Weight Loss (40%)",
-            "hba1c":       "HbA1c Reduction (40%)",
-            "mash":        "MASH Resolution (10%)",
-            "alt":         "ALT Reduction (10%)",
-        }
-        for ep_key, ep_label in ep_labels.items():
-            ep = eps.get(ep_key, {})
-            td = ep.get("trial_details", {})
-            has_score = ep.get("score") is not None
-            fill = SCORE_FILL if has_score else MISSING_FILL
-
-            values = [
-                ep_label,
-                f"{ep.get('raw_value', 'N/A')}" if has_score else "N/A",
-                f"{ep.get('best_value', 'N/A')}" if has_score else "N/A",
-                f"Phase {ep.get('phase_used', 'N/A')}" if has_score else "N/A",
-                str(ep.get("score", "N/A")),
-                f"{td.get('trial_id','N/A')} | {td.get('dosage','N/A')} | {ep.get('reason','N/A')}",
-            ]
-            for col_letter, val in zip(["A", "B", "C", "D", "E", "F"], values):
-                c = ws2[f"{col_letter}{row}"]
-                c.value     = val
-                c.font      = VALUE_FONT
-                c.fill      = fill
-                c.alignment = WRAP
-                c.border    = BDR
-            row += 1
-
-        row += 1  # spacer
-
-        # Score breakdown text block
-        ws2.merge_cells(f"A{row}:F{row}")
-        hdr = ws2[f"A{row}"]
-        hdr.value     = "Score Breakdown"
-        hdr.font      = SECTION_FONT
-        hdr.fill      = SECTION_FILL
-        hdr.alignment = CENTER
-        row += 1
-
-        for line in score_result.get("score_breakdown", "").split("\n"):
-            ws2.merge_cells(f"A{row}:F{row}")
-            c = ws2[f"A{row}"]
-            c.value     = line
-            c.font      = Font(name="Courier New", size=9)
-            c.alignment = Alignment(wrap_text=False, vertical="top")
-            row += 1
-
-        row += 1  # spacer
-
-        # Narrative rationale
-        if score_rationale:
-            ws2.merge_cells(f"A{row}:F{row}")
-            hdr2 = ws2[f"A{row}"]
-            hdr2.value     = "Clinical Narrative Rationale"
-            hdr2.font      = SECTION_FONT
-            hdr2.fill      = SECTION_FILL
-            hdr2.alignment = CENTER
-            row += 1
-
-            ws2.merge_cells(f"A{row}:F{row + 14}")  # reserve ~15 rows
-            rat_cell = ws2[f"A{row}"]
-            rat_cell.value     = score_rationale
-            rat_cell.font      = Font(name="Arial", size=10)
-            rat_cell.alignment = Alignment(wrap_text=True, vertical="top")
-            ws2.row_dimensions[row].height = 300
-
     wb.save(path)
     print(f"\n[OUTPUT] Wrote {len(rows)} row(s) -> {path}", file=sys.stderr)
     if score_result:
         print(
-            f"[OUTPUT] Score Summary sheet added  "
+            f"[OUTPUT] Score columns added to 'Clinical Trials (Enriched)' sheet  "
             f"(weighted score: {score_result.get('weighted_score','?')} / 5.0)",
             file=sys.stderr,
         )
