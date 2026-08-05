@@ -2691,6 +2691,72 @@ _REDUCTION_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Patterns that indicate a number is a duration (weeks/months/years), not a
+# percentage. "68 weeks", "at week 68", "at 68 wk" etc.
+_DURATION_CONTEXT_RE = re.compile(
+    r"(?:at\s+week\s+\d|at\s+\d+\s*w(?:ee)?k|(?:over\s+)?\d+[-\s]*w(?:ee)?k"
+    r"|\d+\s*month|\d+\s*year|\d+\s*wk\b)",
+    re.IGNORECASE,
+)
+
+# "at Week 26", "Week 68" — timepoint markers where N is the week number.
+_WEEK_TIMEPOINT_RE = re.compile(r"(?:at\s+)?[Ww]eek\s+(\d+)")
+
+# Numbers that are trial-series ordinals, e.g. "REDEFINE 2", "REIMAGINE 3".
+_TRIAL_SERIES_NUMBER_RE = re.compile(
+    r"(?:REDEFINE|REIMAGINE|STEP|SURPASS|SURMOUNT|PIONEER|SUSTAIN|REDUCE|"
+    r"SUMMIT|ESSENCE|FLOW|SELECT|PHASE|PART|ARM|GROUP|COHORT|STUDY|TRIAL"
+    r")\s+(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Common drug dosages for CagriSema — if the only candidate number equals
+# one of these AND the rationale contains "mg" or "dose", it is a dosage
+# contamination, not a clinical outcome.
+_CAGRISED_DOSAGES = {2.4, 1.0, 1.7, 0.5, 0.25}
+
+
+def _looks_like_duration(value: float, rationale: str) -> bool:
+    """Return True when *value* is most likely a trial duration in weeks.
+    Signatures:
+    - Value >= 48 (implausible as a percentage reduction for these endpoints).
+    - The rationale contains "68 wk", "at 68 weeks", or "at Week 68".
+    """
+    if value >= 48:
+        return True
+    v_str = str(int(value)) if value == int(value) else str(value)
+    if re.search(rf"(?<!\d){re.escape(v_str)}\s*w(?:ee)?k", rationale, re.IGNORECASE):
+        return True
+    for m in _WEEK_TIMEPOINT_RE.finditer(rationale):
+        try:
+            if abs(float(m.group(1)) - value) < 0.5:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _looks_like_trial_series_number(value: float, rationale: str) -> bool:
+    """Return True when *value* matches a trial-series ordinal embedded in
+    the rationale, e.g. the '2' in 'REDEFINE 2 trial' or '3' in 'REIMAGINE 3'."""
+    if value != int(value):
+        return False
+    for m in _TRIAL_SERIES_NUMBER_RE.finditer(rationale):
+        try:
+            if abs(float(m.group(1)) - value) < 0.5:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _looks_like_dosage(value: float, rationale: str) -> bool:
+    """Return True when *value* matches a known CagriSema dosage AND the
+    rationale contains 'mg' or 'dose', suggesting dosage contamination."""
+    if value not in _CAGRISED_DOSAGES:
+        return False
+    return bool(re.search(r"\b(?:mg|dose|dosage)\b", rationale, re.IGNORECASE))
+
 
 def _extract_pct_from_rationale(rationale: str) -> str:
     """Return the most plausible clinical-outcome percentage found in
@@ -2698,13 +2764,16 @@ def _extract_pct_from_rationale(rationale: str) -> str:
     conventionally positive throughout this pipeline).  Returns "" if no
     credible number can be parsed.
 
-    Strategy: collect ALL numeric tokens in the rationale, filter to the
-    plausible range (0 < x ≤ 100), prefer tokens that appear immediately
-    after a reduction/change keyword (within 60 chars), break ties by
-    preferring decimal values and then larger magnitudes (weight loss is
-    typically larger than HbA1c reduction, so the largest contextual match
-    is usually correct for weight; for HbA1c the context keyword anchor
-    takes priority anyway).
+    The function explicitly rejects:
+    - Duration-as-value contamination: a number ≥ 48 (implausible as a
+      percentage reduction) or one that appears next to 'wk'/'week' in the
+      rationale text (e.g. '68 wk' leaking into weight_change_pct).
+    - Dosage contamination: 2.4, 1.0, 1.7 etc. when 'mg'/'dose' appears
+      in the rationale (e.g. 'efficacy estimand for the 2.4/2.4 mg dose').
+    - Year numbers (2020–2030) embedded in publication dates.
+
+    Strategy: collect ALL numeric tokens, filter, score by clinical context
+    keyword proximity, and take the best candidate.
     """
     if not rationale or not rationale.strip():
         return ""
@@ -2717,17 +2786,42 @@ def _extract_pct_from_rationale(rationale: str) -> str:
         except ValueError:
             continue
         abs_f = abs(f)
-        # Skip zero, implausibly large values, and bare integers that could
-        # be trial-size / year fragments (we still allow integers when they
-        # appear inside a clear reduction context below).
+
+        # Hard rejections —————————————————————————————————————————————————
+        # 1. Zero or >100: no clinical endpoint ever reports these.
         if abs_f == 0 or abs_f > 100:
             continue
-        # Check whether a reduction keyword precedes this number within 60 chars.
+        # 2. Looks like a trial duration rather than an outcome %.
+        if _looks_like_duration(abs_f, text):
+            continue
+        # 3. Matches a known drug dosage and the rationale mentions 'mg'.
+        if _looks_like_dosage(abs_f, text):
+            continue
+        # 4. Four-digit year (20XX) appearing in a publication date context.
+        if abs_f >= 2000:
+            continue
+        # 5. Trial-series ordinal (e.g. '2' in 'REDEFINE 2', '3' in
+        #    'REIMAGINE 3'). These are program sub-study labels, not outcomes.
+        if _looks_like_trial_series_number(abs_f, text):
+            continue
+        # 6. Day-of-month in a date context (e.g. '22' in 'June 22, 2025',
+        #    '14' in 'February 14, 2026'). Month names right before the
+        #    number are the giveaway.
+        if abs_f == int(abs_f) and re.search(
+            rf"(?:January|February|March|April|May|June|July|August|September|"
+            rf"October|November|December)\s+{int(abs_f)}(?:st|nd|rd|th)?\b",
+            text, re.IGNORECASE,
+        ):
+            continue
+        # End hard rejections ——————————————————————————————————————————————
+
+        # Score by reduction-keyword proximity
         start = max(0, m.start() - 60)
         window = text[start:m.end()].lower()
         in_context = bool(_REDUCTION_CONTEXT_RE.search(window))
         has_decimal = "." in raw
-        # Sort key: context match first, then prefer decimals, then larger value.
+
+        # Sort key: context match first, then prefer decimals, then larger value
         candidates.append((0 if in_context else 1,
                            0 if has_decimal else 1,
                            -abs_f,
@@ -2742,56 +2836,152 @@ def _extract_pct_from_rationale(rationale: str) -> str:
 
 def _reconcile_pct_from_rationale(final_rows: List[Dict[str, Any]]) -> None:
     """For each efficacy (value, rationale) pair in every row of
-    *final_rows*, extract the numeric value embedded in the rationale text
-    and use it to correct the _change_pct field when the two disagree or
-    when _change_pct is empty.
+    *final_rows*, detect and fix three classes of mismatch between the
+    stored _change_pct and the rationale text:
 
-    This is a post-processing step applied to the already-remapped rows
-    (i.e. the dicts that will be written to Excel), so field names are the
-    final column names from FINAL_COLUMNS, not the internal row keys.
+    1. **Truncation** — the model wrote a rounded integer instead of the
+       precise decimal (e.g. '2' instead of '1.91' for REIMAGINE 2 HbA1c,
+       or '2' instead of '14.2' for REIMAGINE 2 weight).
+    2. **Duration leak** — the paired duration value (e.g. '68' weeks)
+       leaked into the percentage field (spotted in REDEFINE 1 EU row
+       2020-005435-75 weight=68, and REDEFINE 2 EU row 2023-509662-38-00
+       weight=68).
+    3. **Dosage contamination** — the drug dosage (2.4 mg) was written
+       into the percentage field when the rationale supplies no specific
+       outcome number (REIMAGINE 1 / REIMAGINE 3 EU rows).
+
+    When the rationale contains a credible number that differs from the
+    stored value by more than a rounding tolerance, the stored value is
+    overwritten.  When the stored value is clearly a duration or dosage
+    but the rationale contains no better number, the field is cleared
+    rather than left with a misleading value.
+
+    This is a post-processing step on the already-remapped rows (field
+    names match FINAL_COLUMNS).
     """
     field_pairs = [
-        ("hba1c_change_pct",    "hba1c_rationale"),
-        ("weight_change_pct",   "weight_rationale"),
-        ("alt_reduction_pct",   "alt_rationale"),
-        ("mash_resolution_pct", "mash_rationale"),
+        ("hba1c_change_pct",    "hba1c_rationale",    "hba1c_duration"),
+        ("weight_change_pct",   "weight_rationale",   "weight_duration"),
+        ("alt_reduction_pct",   "alt_rationale",      "alt_duration"),
+        ("mash_resolution_pct", "mash_rationale",     "mash_duration"),
     ]
     corrected = 0
+    cleared = 0
     for row in final_rows:
-        for val_field, rat_field in field_pairs:
+        tid = row.get("trial_id", "?")
+        dosage_str = str(row.get("dosage", "") or "")
+        for val_field, rat_field, dur_field in field_pairs:
             rat = str(row.get(rat_field, "") or "").strip()
+            existing = str(row.get(val_field, "") or "").strip()
+            duration = str(row.get(dur_field, "") or "").strip()
+
+            # ── Nothing to check if both value and rationale are empty ──
+            if not existing and not rat:
+                continue
+
+            # ── Check for duration-as-value contamination ────────────────
+            # If the stored value numerically equals the duration (e.g.
+            # weight=68 and duration=68 wk), the duration leaked in.
+            if existing and duration:
+                dur_num_m = re.search(r"\d+(?:\.\d+)?", duration)
+                if dur_num_m:
+                    try:
+                        if abs(float(existing) - float(dur_num_m.group(0))) < 0.05:
+                            rat_val = _extract_pct_from_rationale(rat)
+                            print(
+                                f"  [reconcile] {tid}: {val_field}={existing!r} equals "
+                                f"duration {duration!r} — duration-as-value contamination.",
+                                file=sys.stderr,
+                            )
+                            if rat_val:
+                                print(
+                                    f"  [reconcile] {tid}: overwriting {val_field} "
+                                    f"{existing!r} → {rat_val!r} (from rationale)",
+                                    file=sys.stderr,
+                                )
+                                row[val_field] = rat_val
+                                corrected += 1
+                            else:
+                                print(
+                                    f"  [reconcile] {tid}: clearing {val_field}={existing!r} "
+                                    f"(no credible number in rationale to replace it)",
+                                    file=sys.stderr,
+                                )
+                                row[val_field] = ""
+                                cleared += 1
+                            continue
+                    except ValueError:
+                        pass
+
+            # ── Check for dosage-as-value contamination ─────────────────
+            # If the stored value matches the drug dosage and the rationale
+            # contains 'mg'/'dose' but no specific outcome number, clear it.
+            if existing:
+                try:
+                    existing_f = float(existing)
+                    rat_val = _extract_pct_from_rationale(rat) if rat else ""
+                    if _looks_like_dosage(existing_f, rat or dosage_str):
+                        if not rat_val:
+                            print(
+                                f"  [reconcile] {tid}: {val_field}={existing!r} matches "
+                                f"drug dosage and rationale has no outcome number — "
+                                f"clearing (dosage contamination).",
+                                file=sys.stderr,
+                            )
+                            row[val_field] = ""
+                            cleared += 1
+                            continue
+                        # Rationale does have a non-dosage number — use it
+                        if abs(existing_f - float(rat_val)) > 0.05:
+                            print(
+                                f"  [reconcile] {tid}: {val_field}={existing!r} looks like "
+                                f"dosage; overwriting with rationale value {rat_val!r}",
+                                file=sys.stderr,
+                            )
+                            row[val_field] = rat_val
+                            corrected += 1
+                            continue
+                except ValueError:
+                    pass
+
+            # ── General mismatch: rationale number vs stored value ───────
             if not rat or rat.lower() == "n/a":
                 continue
             rat_val = _extract_pct_from_rationale(rat)
             if not rat_val:
                 continue
-            existing = str(row.get(val_field, "") or "").strip()
             if not existing or existing.lower() == "n/a":
-                # Fill in missing pct from rationale
                 row[val_field] = rat_val
                 corrected += 1
-                print(f"  [reconcile] {row.get('trial_id', '?')}: "
-                      f"set {val_field}={rat_val!r} from rationale "
-                      f"(was empty)", file=sys.stderr)
+                print(
+                    f"  [reconcile] {tid}: set {val_field}={rat_val!r} from "
+                    f"rationale (was empty)",
+                    file=sys.stderr,
+                )
             else:
-                # Compare numerically; correct if they differ by more than
-                # a rounding tolerance (0.05 percentage points).
                 try:
                     existing_f = float(existing)
                     rat_f = float(rat_val)
                     if abs(existing_f - rat_f) > 0.05:
-                        print(f"  [reconcile] {row.get('trial_id', '?')}: "
-                              f"{val_field} mismatch — field={existing!r}, "
-                              f"rationale={rat_val!r}; overwriting with "
-                              f"rationale value", file=sys.stderr)
+                        print(
+                            f"  [reconcile] {tid}: {val_field} mismatch — "
+                            f"field={existing!r}, rationale={rat_val!r}; "
+                            f"overwriting with rationale value",
+                            file=sys.stderr,
+                        )
                         row[val_field] = rat_val
                         corrected += 1
                 except ValueError:
-                    pass  # non-numeric existing value — leave as-is
+                    pass
 
-    if corrected:
-        print(f"  Rationale reconciliation: corrected {corrected} "
-              f"change-pct value(s) from rationale text.", file=sys.stderr)
+    total = corrected + cleared
+    if total:
+        print(
+            f"  Rationale reconciliation: corrected {corrected}, "
+            f"cleared {cleared} change-pct value(s) "
+            f"({total} total).",
+            file=sys.stderr,
+        )
 
 
 def _deduplicate_final_rows(final_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
