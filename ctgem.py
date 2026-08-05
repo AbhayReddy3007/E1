@@ -780,6 +780,19 @@ def normalise_phase(raw: str) -> str:
     return "/".join(nums) if nums else str(raw).strip()
 
 
+def _format_trial_id_with_acronym(row: Dict[str, Any]) -> str:
+    """Return trial_id with acronym appended if one can be extracted, e.g.
+    'NCT05394519 (REDEFINE 2)'. Falls back to the bare trial_id when no
+    recognisable acronym is present in any title field."""
+    trial_id = row.get("trial_id", "")
+    title = (row.get("trial_title", "") or row.get("public_title", "")
+             or row.get("title", "") or row.get("brief_title", "") or "")
+    acronym = _extract_trial_acronym(title)
+    if acronym:
+        return f"{trial_id} ({acronym})"
+    return trial_id
+
+
 def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
     """Collapse a merged registry+Gemini row down to exactly FINAL_COLUMNS.
 
@@ -790,7 +803,7 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
     return {
         "molecule_name": drug,
         "registry_source": row.get("source", "") or row.get("registry_source", ""),
-        "trial_id": row.get("trial_id", ""),
+        "trial_id": _format_trial_id_with_acronym(row),
         "dosage": row.get("dosage", ""),
         "phase": normalise_phase(row.get("phase", "")),
         "trial_title": (row.get("trial_title", "") or row.get("title", "")
@@ -2652,6 +2665,190 @@ async def enrich(drug: str, max_records: Optional[int] = None,
     return list(rows_by_id.values())
 
 
+# ---------------------------------------------------------------------------
+# Rationale → change-pct reconciliation
+#
+# Gemini occasionally puts the correct number in the rationale text (e.g.
+# "HbA1c reduction of 1.91 points … REIMAGINE 2 trial") while writing a
+# different (or blank) value into the _change_pct field — usually because
+# the structured field was filled in an earlier pass or batch whose number
+# drifted from the rationale written in a later pass.  This pass extracts
+# the first plausible numeric value from each rationale field and, when it
+# disagrees with the paired _change_pct value (or the _change_pct is
+# empty), overwrites _change_pct with the number from the rationale.
+# ---------------------------------------------------------------------------
+
+# Match any standalone number (integer or decimal) — used to collect ALL
+# candidate values from a rationale string before filtering by context.
+_ALL_NUMBERS_RE = re.compile(r"(?<![0-9.])(-?\d+(?:\.\d+)?)(?:%)?(?![0-9.])")
+
+# Keywords that indicate a number immediately following (within ~60 chars)
+# is a clinical-outcome percentage rather than a dosage, year, or count.
+_REDUCTION_CONTEXT_RE = re.compile(
+    r"(?:reduction|reduced|decrease|decreased|change|loss|lost|lower|lowering|"
+    r"improvement|improved|percentage\s+point|%-point|mean\s+change|estimated\s+mean|"
+    r"hba1c|weight\s+loss|body\s+weight|alt|mash|nash|fibrosis)\s{0,30}",
+    re.IGNORECASE,
+)
+
+
+def _extract_pct_from_rationale(rationale: str) -> str:
+    """Return the most plausible clinical-outcome percentage found in
+    *rationale*, stored as a positive bare string (reductions are
+    conventionally positive throughout this pipeline).  Returns "" if no
+    credible number can be parsed.
+
+    Strategy: collect ALL numeric tokens in the rationale, filter to the
+    plausible range (0 < x ≤ 100), prefer tokens that appear immediately
+    after a reduction/change keyword (within 60 chars), break ties by
+    preferring decimal values and then larger magnitudes (weight loss is
+    typically larger than HbA1c reduction, so the largest contextual match
+    is usually correct for weight; for HbA1c the context keyword anchor
+    takes priority anyway).
+    """
+    if not rationale or not rationale.strip():
+        return ""
+    text = rationale.strip()
+    candidates = []
+    for m in _ALL_NUMBERS_RE.finditer(text):
+        raw = m.group(1)
+        try:
+            f = float(raw)
+        except ValueError:
+            continue
+        abs_f = abs(f)
+        # Skip zero, implausibly large values, and bare integers that could
+        # be trial-size / year fragments (we still allow integers when they
+        # appear inside a clear reduction context below).
+        if abs_f == 0 or abs_f > 100:
+            continue
+        # Check whether a reduction keyword precedes this number within 60 chars.
+        start = max(0, m.start() - 60)
+        window = text[start:m.end()].lower()
+        in_context = bool(_REDUCTION_CONTEXT_RE.search(window))
+        has_decimal = "." in raw
+        # Sort key: context match first, then prefer decimals, then larger value.
+        candidates.append((0 if in_context else 1,
+                           0 if has_decimal else 1,
+                           -abs_f,
+                           abs_f,
+                           raw))
+    if not candidates:
+        return ""
+    candidates.sort()
+    abs_f = candidates[0][3]
+    return f"{abs_f:g}"
+
+
+def _reconcile_pct_from_rationale(final_rows: List[Dict[str, Any]]) -> None:
+    """For each efficacy (value, rationale) pair in every row of
+    *final_rows*, extract the numeric value embedded in the rationale text
+    and use it to correct the _change_pct field when the two disagree or
+    when _change_pct is empty.
+
+    This is a post-processing step applied to the already-remapped rows
+    (i.e. the dicts that will be written to Excel), so field names are the
+    final column names from FINAL_COLUMNS, not the internal row keys.
+    """
+    field_pairs = [
+        ("hba1c_change_pct",    "hba1c_rationale"),
+        ("weight_change_pct",   "weight_rationale"),
+        ("alt_reduction_pct",   "alt_rationale"),
+        ("mash_resolution_pct", "mash_rationale"),
+    ]
+    corrected = 0
+    for row in final_rows:
+        for val_field, rat_field in field_pairs:
+            rat = str(row.get(rat_field, "") or "").strip()
+            if not rat or rat.lower() == "n/a":
+                continue
+            rat_val = _extract_pct_from_rationale(rat)
+            if not rat_val:
+                continue
+            existing = str(row.get(val_field, "") or "").strip()
+            if not existing or existing.lower() == "n/a":
+                # Fill in missing pct from rationale
+                row[val_field] = rat_val
+                corrected += 1
+                print(f"  [reconcile] {row.get('trial_id', '?')}: "
+                      f"set {val_field}={rat_val!r} from rationale "
+                      f"(was empty)", file=sys.stderr)
+            else:
+                # Compare numerically; correct if they differ by more than
+                # a rounding tolerance (0.05 percentage points).
+                try:
+                    existing_f = float(existing)
+                    rat_f = float(rat_val)
+                    if abs(existing_f - rat_f) > 0.05:
+                        print(f"  [reconcile] {row.get('trial_id', '?')}: "
+                              f"{val_field} mismatch — field={existing!r}, "
+                              f"rationale={rat_val!r}; overwriting with "
+                              f"rationale value", file=sys.stderr)
+                        row[val_field] = rat_val
+                        corrected += 1
+                except ValueError:
+                    pass  # non-numeric existing value — leave as-is
+
+    if corrected:
+        print(f"  Rationale reconciliation: corrected {corrected} "
+              f"change-pct value(s) from rationale text.", file=sys.stderr)
+
+
+def _deduplicate_final_rows(final_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate remapped rows by their bare trial ID (stripping the
+    appended acronym so 'NCT05394519 (REDEFINE 2)' and a plain
+    'NCT05394519' still map to the same bucket).
+
+    When the same underlying trial appears more than once (e.g. once from
+    CT.gov and once from an EU CTIS/EudraCT row), keep the single row that
+    has the most efficacy data.  Ties are broken by preferring CT.gov rows
+    (registry_source == 'ctgov') over EU rows, then by alphabetical
+    trial_id for a stable, reproducible result.
+    """
+    def _bare_id(trial_id_str: str) -> str:
+        """Strip the '(ACRONYM)' suffix added by _format_trial_id_with_acronym."""
+        return trial_id_str.split("(")[0].strip()
+
+    def _efficacy_count(row: Dict[str, Any]) -> int:
+        return sum(
+            1 for f in ("hba1c_change_pct", "weight_change_pct",
+                        "alt_reduction_pct", "mash_resolution_pct")
+            if str(row.get(f, "")).strip()
+        )
+
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in final_rows:
+        key = _bare_id(str(row.get("trial_id", "")))
+        groups.setdefault(key, []).append(row)
+
+    deduped: List[Dict[str, Any]] = []
+    removed = 0
+    for key, grp in groups.items():
+        if len(grp) == 1:
+            deduped.append(grp[0])
+            continue
+        # Sort: most efficacy data first, then prefer ctgov, then by trial_id
+        grp_sorted = sorted(
+            grp,
+            key=lambda r: (
+                -_efficacy_count(r),
+                0 if str(r.get("registry_source", "")).lower() == "ctgov" else 1,
+                str(r.get("trial_id", "")),
+            ),
+        )
+        deduped.append(grp_sorted[0])
+        removed += len(grp) - 1
+        kept_src = grp_sorted[0].get("registry_source", "?")
+        all_srcs = [r.get("registry_source", "?") for r in grp]
+        print(f"  [dedup] {key}: kept {kept_src!r} row (of {all_srcs}) "
+              f"— removed {len(grp) - 1} duplicate(s)", file=sys.stderr)
+
+    if removed:
+        print(f"  Deduplication: removed {removed} duplicate trial row(s); "
+              f"{len(deduped)} unique trial(s) remain.", file=sys.stderr)
+    return deduped
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2707,6 +2904,16 @@ def main() -> int:
               f"both passes — check these rows.", file=sys.stderr)
 
     final_rows = [remap_row(row, args.drug) for row in rows]
+
+    # Deduplicate rows that represent the same trial across registries
+    # (e.g. both a CT.gov row and an EU CTIS/EudraCT row for the same trial).
+    # Must run AFTER remap_row so the trial_id already has its '(ACRONYM)'
+    # suffix and the efficacy fields are in their final column names.
+    final_rows = _deduplicate_final_rows(final_rows)
+
+    # Fix any mismatch between the rationale text (which often contains the
+    # precise number Gemini found) and the _change_pct field.
+    _reconcile_pct_from_rationale(final_rows)
 
     os.makedirs(args.outdir, exist_ok=True)
     drug_slug = args.drug.lower().replace(" ", "_")
