@@ -660,12 +660,16 @@ GEMINI_FIELD_MAP = {
     "Completion Date": "trial_completion_date",
     "HbA1c Change (%)": "hba1c_change_pct",
     "HbA1c Duration": "hba1c_duration",
+    "HbA1c Source URL": "hba1c_source_url",
     "Weight Loss (%)": "weight_change_pct",
     "Weight Duration": "weight_duration",
+    "Weight Source URL": "weight_source_url",
     "ALT Reduction (%)": "alt_reduction_pct",
     "ALT Duration": "alt_duration",
+    "ALT Source URL": "alt_source_url",
     "MASH Outcome (%)": "mash_resolution_pct",
     "MASH Duration": "mash_duration",
+    "MASH Source URL": "mash_source_url",
     "Company": "company_name",
     "Source URL": "source_url",
 }
@@ -687,18 +691,19 @@ FINAL_COLUMNS = [
     "phase_status",
     "hba1c_change_pct",
     "hba1c_duration",
+    "hba1c_source_url",       # URL of publication/release where HbA1c figure was found
     "weight_change_pct",
     "weight_duration",
+    "weight_source_url",      # URL of publication/release where weight figure was found
     "alt_reduction_pct",
     "alt_duration",
+    "alt_source_url",
     "mash_resolution_pct",
     "mash_duration",
+    "mash_source_url",
     "company_name",
     "source_url",
-    # Per-value audit trail written by _verify_efficacy_grounding: says, for
-    # each efficacy number present, whether it was actually found in the
-    # CT.gov record ("registry"), in a matched publication ("pubmed"), or
-    # in neither ("unverified"). Read this before trusting a number.
+    # Per-value audit trail: "registry", "pubmed", or "unverified" per field.
     "efficacy_provenance",
 ]
 
@@ -749,12 +754,16 @@ def remap_row(row: Dict[str, Any], drug: str) -> Dict[str, Any]:
         "phase_status": row.get("phase_status", "") or row.get("status", ""),
         "hba1c_change_pct": row.get("hba1c_change_pct", ""),
         "hba1c_duration": row.get("hba1c_duration", ""),
+        "hba1c_source_url": row.get("hba1c_source_url", ""),
         "weight_change_pct": row.get("weight_change_pct", ""),
         "weight_duration": row.get("weight_duration", ""),
+        "weight_source_url": row.get("weight_source_url", ""),
         "alt_reduction_pct": row.get("alt_reduction_pct", ""),
         "alt_duration": row.get("alt_duration", ""),
+        "alt_source_url": row.get("alt_source_url", ""),
         "mash_resolution_pct": row.get("mash_resolution_pct", ""),
         "mash_duration": row.get("mash_duration", ""),
+        "mash_source_url": row.get("mash_source_url", ""),
         "company_name": row.get("company_name", "") or row.get("sponsor", ""),
         "source_url": row.get("source_url", "") or row.get("url", ""),
         "efficacy_provenance": row.get("efficacy_provenance", ""),
@@ -1631,7 +1640,7 @@ def _numeric_variants(value: str) -> List[str]:
     if not m:
         return []
     num = m.group(0)
-    variants = {num}
+    variants: set = {num}
     try:
         f = float(num)
     except ValueError:
@@ -1644,6 +1653,58 @@ def _numeric_variants(value: str) -> List[str]:
     variants.add(f"{f:.1f}")
     variants.add(f"{f:.2f}")
     return [v for v in variants if v]
+
+
+def _grounding_match(value: str, text: str) -> bool:
+    """Check whether a numeric value is present in text as a standalone
+    number — NOT as a substring of a larger number.
+
+    Plain substring matching fails badly for small decimals: '1.8' is a
+    substring of '7.8', '35.8', '1.80', etc., so a grounding check using
+    `v in text` will falsely confirm any HbA1c reduction of 1.8 against
+    registry text that merely mentions a baseline HbA1c of 7.8% or a BMI
+    of 35.8. The fix is to require word boundaries around the number, so
+    '1.8' only matches when it appears as an isolated token in the source
+    (possibly preceded by '-' for a reduction, possibly followed by '%').
+
+    We also explicitly require that a NEGATIVE-direction indicator
+    ('-', '−', 'reduction', 'decrease', 'loss', 'lower') appears
+    NEARBY (within 60 chars before the number) for clinical-outcome
+    fields, because a registry page discussing 'baseline HbA1c 7.8%' or
+    'BMI 35.8' will mention the number in a positive context, not in the
+    context of a treatment effect. This is the key distinction between
+    "this number is on this page" and "this page describes this result".
+    """
+    if not text or not value:
+        return False
+    variants = _numeric_variants(value)
+    if not variants:
+        return False
+
+    # Build one combined alternation pattern for all surface forms.
+    # Require: optional leading '-'/'−', then the number, then optional '%'.
+    # Require word boundaries on both sides so '1.8' doesn't match inside '7.8'.
+    escaped = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+    number_pattern = rf"(?<![0-9.])(?:-|−)?(?:{escaped})(?:%|\s|$|[^0-9.])"
+
+    for m in re.finditer(number_pattern, text):
+        # Found the number as a standalone token. Now verify it appears in
+        # a reduction/change context within a 80-char window before it, to
+        # avoid matching the same digits in completely unrelated contexts
+        # (baseline values, BMIs, ages, etc.).
+        start = max(0, m.start() - 80)
+        window = text[start:m.end()].lower()
+        reduction_cues = (
+            "reduction", "reduced", "decrease", "decreased", "change",
+            "loss", "lost", "lower", "lowering", "improvement", "improved",
+            "percentage point", "%-point", "%−point", "mean change",
+            "estimated mean", "hba1c", "weight loss", "body weight",
+            "alt", "alanine", "mash", "nash", "fibrosis",
+        )
+        if any(cue in window for cue in reduction_cues):
+            return True
+
+    return False
 
 
 def _verify_efficacy_grounding(
@@ -1698,13 +1759,38 @@ def _verify_efficacy_grounding(
             val = str(row.get(value_field, "")).strip()
             if not val:
                 continue
-            variants = _numeric_variants(val)
-            if variants and any(v in registry_text for v in variants):
+            if _grounding_match(val, registry_text):
                 source = "registry"
-            elif variants and any(v in pubmed_text for v in variants):
+            elif _grounding_match(val, pubmed_text):
                 source = "pubmed"
             else:
                 source = "unverified"
+
+            # Record the confirmed source URL in the per-outcome source
+            # column (hba1c_source_url / weight_source_url / etc.). Only
+            # write it if Gemini didn't already fill one in from its own
+            # search (Gemini's URL is more specific — it knows exactly
+            # which press release or paper it read; ours is a best-effort
+            # placeholder from the prefetched content URL or PubMed).
+            source_url_field = value_field.replace("_change_pct", "_source_url") \
+                                          .replace("_reduction_pct", "_source_url") \
+                                          .replace("_resolution_pct", "_source_url")
+            if not row.get(source_url_field):
+                if source == "registry":
+                    # Best available URL: the registry page for this trial.
+                    row[source_url_field] = (
+                        row.get("source_url") or row.get("url") or
+                        (f"https://clinicaltrials.gov/study/{tid}"
+                         if _is_ctgov_id(tid) else "")
+                    )
+                elif source == "pubmed":
+                    # The PubMed search found a paper — use the first PMID
+                    # if we can extract it from the abstract text.
+                    pmid_m = re.search(r"\bPMID[:\s]+(\d+)\b", pubmed_text, re.IGNORECASE)
+                    if pmid_m:
+                        row[source_url_field] = (
+                            f"https://pubmed.ncbi.nlm.nih.gov/{pmid_m.group(1)}/"
+                        )
 
             counts[source] += 1
             label = value_field.replace("_change_pct", "").replace("_reduction_pct", "") \
